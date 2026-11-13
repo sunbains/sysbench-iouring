@@ -1,13 +1,14 @@
 # sysbench-cpp
 
-A C++26 port of [sysbench](https://github.com/akopytov/sysbench) built around a
-strict hierarchy of pre-reserved allocators, a coroutine runtime that owns all
-worker scheduling, io_uring with registered network buffers, an async MySQL
-wire client, and a sysbench-compatible Lua benchmark interface.
+A C++26 port of [sysbench](https://github.com/akopytov/sysbench), a great tool
+that I have used forever. This port is built around a strict hierarchy of
+pre-reserved allocators, a coroutine runtime that owns all worker scheduling,
+io_uring with registered network buffers, an async MySQL wire client, and a
+sysbench-compatible Lua benchmark interface.
 
-The reference implementation in `~/dev/sysbench` was used for the Lua API,
-benchmark scripts, command names, option semantics, statistics and output
-formats.
+The reference implementation from [sysbench](https://github.com/akopytov/sysbench)
+was used for the Lua API, benchmark scripts, command names, option semantics,
+statistics and output formats.
 
 ## Highlights
 
