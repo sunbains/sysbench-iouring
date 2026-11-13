@@ -1,5 +1,7 @@
 # Architecture
 
+An illustrated, animated walkthrough is in [architecture.html](architecture.html).
+
 ## Memory hierarchy
 
 ```
