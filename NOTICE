@@ -1,0 +1,14 @@
+sysbench-cpp
+============
+
+The benchmark scripts under lua/ (oltp_*.lua, bulk_insert.lua, empty-test.lua,
+prime-test.lua, select_random_*.lua) and the public Lua API design are derived
+from sysbench by Alexey Kopytov and contributors:
+
+    https://github.com/akopytov/sysbench
+
+sysbench is licensed under the GNU General Public License, version 2.  This
+project is distributed under the same license.  See COPYING.
+
+The C++ implementation, memory hierarchy, runtime, io_uring transport, MySQL
+wire client, Lua bridge and tests are original work for this project.
