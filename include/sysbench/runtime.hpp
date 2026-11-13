@@ -67,6 +67,10 @@ public:
         bool m_pin_workers = true;
         bool m_numa_aware = true;
         std::uint32_t m_first_cpu = 0;
+        // How long wait() lets every task stay outstanding with no worker
+        // running before it reports a stalled connection and returns.  Zero
+        // waits forever.
+        std::chrono::milliseconds m_stall_timeout{60000};
     };
 
     Runtime() = default;
@@ -116,9 +120,17 @@ public:
         spawn_on(choose_worker(), std::forward<Factory>(factory));
     }
 
-    // Wait until every spawned top-level task has completed.
-    void wait();
+    // Wait until every spawned top-level task has completed.  Returns false,
+    // after printing an error, when the tasks stay outstanding with no worker
+    // running for longer than the configured stall timeout: the server has
+    // stopped answering and there is nothing left to wait for.
+    bool wait();
     [[nodiscard]] bool wait_for(std::chrono::nanoseconds timeout);
+
+    // True when wait()/wait_for() stopped because no task made progress.
+    [[nodiscard]] bool stall_detected() const noexcept {
+        return m_stall_detected.load(std::memory_order_acquire);
+    }
 
     // Cooperative stop request observed by benchmark loops (for SIGINT/time).
     void request_stop() noexcept { m_stop_requested.store(true, std::memory_order_release); }
@@ -175,6 +187,9 @@ private:
     void finish_task() noexcept;
     [[nodiscard]] int spawn_numa_node(std::uint32_t worker) const;
     [[nodiscard]] std::uint32_t choose_worker() noexcept;
+    // @return true when the outstanding tasks have made no progress for the
+    // stall timeout; prints the error once.
+    [[nodiscard]] bool check_stall(std::int64_t outstanding);
 
     Worker* m_workers = nullptr;
     void* m_worker_storage = nullptr;
@@ -196,6 +211,13 @@ private:
     ShardedCounter<std::uint64_t, kMaxWorkers> m_resumes;
     std::atomic<std::uint32_t> m_active_tasks{0};
     std::atomic<bool> m_undersubscribed{true};
+    // Workers currently inside resume().  A stalled benchmark has none: every
+    // task is suspended waiting for a completion that will never arrive.
+    std::atomic<std::uint32_t> m_busy_workers{0};
+    std::chrono::milliseconds m_stall_timeout{0};
+    std::int64_t m_last_outstanding{-1};
+    std::chrono::steady_clock::time_point m_idle_since{};
+    std::atomic<bool> m_stall_detected{false};
     int m_wait_event_fd = -1;
 };
 

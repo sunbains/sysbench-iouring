@@ -31,8 +31,12 @@
 
 #include <atomic>
 #include <cerrno>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
+#include <thread>
 
 using namespace sb;
 
@@ -223,7 +227,129 @@ TEST("ring connect and accept") {
     runtime.shutdown();
 }
 
+/*
+  The benchmark engine starts one connection per benchmark thread at once:
+  on a run with thousands of threads, a few hundred workers (or fewer) run
+  thousands of connect coroutines, each with its own SocketIo and reaper
+  thread.  A lost completion or a lost park wakeup leaves some of those
+  coroutines suspended forever, and Runtime::wait() never returns -- the
+  whole benchmark then sits in poll with no output.  This test drives exactly
+  that shape: many connect coroutines on a handful of workers, all connecting
+  to one accepting socket.
+*/
+Task<void> mass_connect(const char* path, std::size_t path_length,
+                        std::atomic<std::uint64_t>& connected,
+                        std::atomic<std::uint64_t>& failed) {
+    SocketIo io(*Runtime::current(), Runtime::current_worker_id(), 256, 2, 4096);
+    const int fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (fd < 0) {
+        failed.fetch_add(1, std::memory_order_relaxed);
+        co_return;
+    }
+
+    sockaddr_un address{};
+    address.sun_family = AF_UNIX;
+    std::memcpy(address.sun_path + 1, path, path_length);
+    const socklen_t address_length = static_cast<socklen_t>(
+        offsetof(sockaddr_un, sun_path) + 1 + path_length);
+
+    const int connected_result = co_await ring_connect(
+        io, fd, reinterpret_cast<sockaddr*>(&address), address_length);
+    if (connected_result == 0) {
+        connected.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        failed.fetch_add(1, std::memory_order_relaxed);
+    }
+    ::close(fd);
+}
+
+Task<void> mass_accept(int listener, std::size_t count,
+                       std::atomic<std::uint64_t>& accepted,
+                       std::atomic<std::uint64_t>& failed) {
+    SocketIo io(*Runtime::current(), Runtime::current_worker_id(), 256, 2, 4096);
+    for (std::size_t i = 0; i < count; ++i) {
+        sockaddr_un peer{};
+        socklen_t peer_length = sizeof(peer);
+        const int fd = co_await ring_accept(io, listener,
+                                           reinterpret_cast<sockaddr*>(&peer),
+                                           &peer_length);
+        if (fd < 0) {
+            failed.fetch_add(1, std::memory_order_relaxed);
+            co_return;
+        }
+        accepted.fetch_add(1, std::memory_order_relaxed);
+        ::close(fd);
+    }
+}
+
+void mass_connect_test(Runtime& runtime, std::size_t connections) {
+    char name[64]{};
+    std::snprintf(name, sizeof(name), "sysbench-cpp-mass-%d", static_cast<int>(::getpid()));
+    const std::size_t name_length = std::strlen(name) + 1;
+
+    const int listener =
+        ::socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    CHECK(listener >= 0);
+
+    sockaddr_un address{};
+    address.sun_family = AF_UNIX;
+    std::memcpy(address.sun_path + 1, name, name_length);
+    const socklen_t address_length = static_cast<socklen_t>(
+        offsetof(sockaddr_un, sun_path) + 1 + name_length);
+
+    CHECK_EQ(::bind(listener, reinterpret_cast<sockaddr*>(&address), address_length), 0);
+    CHECK_EQ(::listen(listener, static_cast<int>(connections)), 0);
+
+    std::atomic<std::uint64_t> connected{0};
+    std::atomic<std::uint64_t> accepted{0};
+    std::atomic<std::uint64_t> connect_failed{0};
+    std::atomic<std::uint64_t> accept_failed{0};
+    std::atomic<bool> finished{false};
+
+    std::thread watchdog([&finished] {
+        for (int i = 0; i < 120 && !finished.load(std::memory_order_acquire); ++i) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+        if (!finished.load(std::memory_order_acquire)) {
+            std::println(stderr, "HANG: mass connect never completed");
+            std::_Exit(2);
+        }
+    });
+
+    runtime.spawn(mass_accept(listener, connections, accepted, accept_failed));
+    for (std::size_t i = 0; i < connections; ++i) {
+        runtime.spawn(mass_connect(name, name_length, connected, connect_failed));
+    }
+    runtime.wait();
+    finished.store(true, std::memory_order_release);
+    watchdog.join();
+
+    std::println("  mass connect: connections={} connected={} accepted={} "
+                 "connect_failed={} accept_failed={}",
+                 connections, connected.load(), accepted.load(),
+                 connect_failed.load(), accept_failed.load());
+    CHECK_EQ(connected.load(), connections);
+    CHECK_EQ(accepted.load(), connections);
+    CHECK_EQ(connect_failed.load(), 0u);
+    ::close(listener);
+}
+
+TEST("many concurrent connect coroutines") {
+    const char* requested = std::getenv("SYSBENCH_MASS_CONNECTIONS");
+    const std::size_t connections =
+        requested != nullptr ? std::strtoull(requested, nullptr, 10) : 4096;
+
+    Runtime runtime;
+    runtime.start(Runtime::Config{.m_workers = 8,
+                                  .m_worker_heap_bytes = 512 * 1024 * 1024});
+    mass_connect_test(runtime, connections);
+    runtime.shutdown();
+}
+
 int main(int argc, char** argv) {
-    mem::GlobalAllocator::instance().initialize(1024ull * 1024 * 1024);
+    // The mass-connect test keeps thousands of SocketIo objects (rings and
+    // registered buffers) alive at once, like the benchmark engine does for
+    // thousands of connections.
+    mem::GlobalAllocator::instance().initialize(8ull * 1024 * 1024 * 1024);
     return ::sb::test::run_all(argc, argv);
 }

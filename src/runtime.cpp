@@ -243,7 +243,9 @@ struct alignas(4096) Runtime::Worker {
     void resume(PromiseBase* task) noexcept {
         detail::tls_worker = this;
         detail::tls_current = task;
+        m_runtime->m_busy_workers.fetch_add(1, std::memory_order_relaxed);
         task->m_self.resume();
+        m_runtime->m_busy_workers.fetch_sub(1, std::memory_order_relaxed);
         detail::tls_current = nullptr;
         m_runtime->m_resumes.add(m_id, 1);
     }
@@ -373,6 +375,10 @@ void Runtime::start(const Config& config_input) {
     if (config.m_worker_heap_bytes < 1024 * 1024) config.m_worker_heap_bytes = 1024 * 1024;
     m_config = config;
     m_worker_count = config.m_workers;
+    m_stall_timeout = config.m_stall_timeout;
+    m_stall_detected.store(false, std::memory_order_release);
+    m_last_outstanding = -1;
+    m_idle_since = Clock::now();
     m_wait_event_fd = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     if (m_wait_event_fd < 0) {
         m_worker_count = 0;
@@ -642,11 +648,60 @@ void Runtime::finish_task() noexcept {
     }
 }
 
-void Runtime::wait() {
+bool Runtime::check_stall(std::int64_t outstanding) {
+    if (outstanding <= 0) return false;
+
+    const auto now = Clock::now();
+
+    if (outstanding != m_last_outstanding ||
+        m_busy_workers.load(std::memory_order_acquire) != 0) {
+        m_last_outstanding = outstanding;
+        m_idle_since = now;
+        return false;
+    }
+
+    if (m_stall_timeout <= std::chrono::milliseconds(0) ||
+        now - m_idle_since < m_stall_timeout)
+        return false;
+
+    if (m_stall_detected.exchange(true, std::memory_order_acq_rel)) return true;
+
+    const auto stalled_for = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now - m_idle_since);
+    const auto stalled_ms = stalled_for.count();
+
+    if (stalled_ms >= 1000) {
+        std::println(stderr,
+                     "sysbench: no progress for {}s with {} task(s) "
+                     "outstanding; a server connection appears to have stalled",
+                     stalled_ms / 1000, outstanding);
+    } else {
+        std::println(stderr,
+                     "sysbench: no progress for {}ms with {} task(s) "
+                     "outstanding; a server connection appears to have stalled",
+                     stalled_ms, outstanding);
+    }
+    return true;
+}
+
+bool Runtime::wait() {
+    // A task suspended on a completion the server will never send leaves
+    // m_outstanding above zero forever.  Report that instead of sleeping in
+    // poll() indefinitely: if no worker is running and the outstanding count
+    // has not moved for the stall timeout, the connection is stalled.
+    constexpr auto slice = std::chrono::milliseconds(200);
+
     for (;;) {
-        if (m_workers == nullptr || m_outstanding.sum(m_worker_count) == 0) return;
+        if (m_workers == nullptr) return true;
+
+        const std::int64_t outstanding = m_outstanding.sum(m_worker_count);
+
+        if (outstanding <= 0) return true;
+        if (check_stall(outstanding)) return false;
+
         pollfd descriptor{.fd = m_wait_event_fd, .events = POLLIN, .revents = 0};
-        const int result = ::poll(&descriptor, 1, -1);
+        const int result =
+            ::poll(&descriptor, 1, static_cast<int>(slice.count()));
         if (result > 0 && (descriptor.revents & POLLIN) != 0) {
             std::uint64_t counter = 0;
             const ssize_t ignored = ::read(m_wait_event_fd, &counter, sizeof(counter));
@@ -658,7 +713,16 @@ void Runtime::wait() {
 bool Runtime::wait_for(std::chrono::nanoseconds timeout) {
     const auto deadline = Clock::now() + timeout;
     for (;;) {
-        if (m_workers == nullptr || m_outstanding.sum(m_worker_count) == 0) return true;
+        if (m_workers == nullptr) return true;
+
+        const std::int64_t outstanding = m_outstanding.sum(m_worker_count);
+
+        if (outstanding <= 0) return true;
+
+        // A stall ends the wait as if the work were done; the caller checks
+        // stall_detected() and reports the failure.
+        if (check_stall(outstanding)) return true;
+
         const auto now = Clock::now();
         if (now >= deadline) return false;
         const auto remaining =

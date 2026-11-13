@@ -90,6 +90,10 @@ Options::Options(mem::MemoryResource& resource) : m_resource(&resource) {
         OptionType::Bool, "on");
     add("pin-workers", "Pin worker threads to their assigned CPUs",
         OptionType::Bool, "on");
+    add("stall-timeout",
+        "Report a stalled connection after N seconds without progress "
+        "(0 = wait forever)",
+        OptionType::Int, "60");
     add("seed", "Random seed (0 = time based)", OptionType::Int, "0");
     add("rand-seed", "Alias for --seed", OptionType::Int, "0");
     add("rand-pareto-h", "Shape parameter for Pareto distribution",

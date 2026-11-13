@@ -23,6 +23,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <coroutine>
 #include <thread>
 #include <vector>
 
@@ -179,6 +180,49 @@ TEST("runtime yield throughput") {
     std::println("  yield: {:.1f} M switches/s", ops / 1e6);
     CHECK_EQ(count.load(), kYields + 1);
     CHECK(ops > 500'000.0);
+    runtime.shutdown();
+}
+
+/*
+  A connection whose completion never arrives leaves the task suspended with
+  nothing in any run queue and every worker parked: the shape of the hang seen
+  when the server stops answering.  Runtime::wait() must notice that no
+  progress is possible and report it instead of waiting forever.
+*/
+struct Never_ready {
+    [[nodiscard]] bool await_ready() const noexcept { return false; }
+    void await_suspend(std::coroutine_handle<>) const noexcept {}
+    void await_resume() const noexcept {}
+};
+
+Task<void> wait_forever() { co_await Never_ready{}; }
+
+TEST("a stalled task is reported instead of waited for forever") {
+    Runtime runtime;
+    runtime.start(Runtime::Config{.m_workers = 2,
+                                  .m_worker_heap_bytes = 2 * 1024 * 1024,
+                                  .m_stall_timeout = 300ms});
+    runtime.spawn(wait_forever());
+
+    const auto started = std::chrono::steady_clock::now();
+    CHECK(!runtime.wait());
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - started);
+    CHECK(elapsed >= 250ms);
+    runtime.shutdown();
+}
+
+TEST("a stalled task is reported by the report-interval wait") {
+    Runtime runtime;
+    runtime.start(Runtime::Config{.m_workers = 2,
+                                  .m_worker_heap_bytes = 2 * 1024 * 1024,
+                                  .m_stall_timeout = 250ms});
+    runtime.spawn(wait_forever());
+
+    bool done = false;
+    for (int i = 0; i < 40 && !done; ++i) done = runtime.wait_for(200ms);
+    CHECK(done);
+    CHECK(runtime.stall_detected());
     runtime.shutdown();
 }
 

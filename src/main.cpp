@@ -100,7 +100,7 @@ std::uint64_t choose_worker_heap(std::uint64_t root_capacity,
                                  std::uint32_t workers,
                                  std::uint64_t buffer_bytes) {
     constexpr std::uint64_t minimum = 4ull * 1024 * 1024;
-    constexpr std::uint64_t maximum = 64ull * 1024 * 1024;
+    constexpr std::uint64_t maximum = 512ull * 1024 * 1024;
     if (root_capacity <= main_heap + buffer_bytes + minimum) return minimum;
     const std::uint64_t available =
         (root_capacity - main_heap - buffer_bytes) * 8 / 10;
@@ -283,6 +283,8 @@ int main(int argc, char** argv) {
     run_options.m_seed = static_cast<std::uint64_t>(std::max<std::int64_t>(0, seed));
     const bool numa_enabled = options.as_bool("numa", true);
     const bool pin_workers = options.as_bool("pin-workers", true);
+    const std::int64_t stall_seconds =
+        std::max<std::int64_t>(0, options.as_int("stall-timeout", 60));
 
     if (parsed.m_command == "help") {
         const int result = engine->call_help();
@@ -297,7 +299,8 @@ int main(int argc, char** argv) {
             .m_worker_heap_bytes = static_cast<std::size_t>(worker_heap_bytes),
             .m_pin_workers = pin_workers,
             .m_numa_aware = numa_enabled,
-            .m_first_cpu = 0});
+            .m_first_cpu = 0,
+            .m_stall_timeout = std::chrono::milliseconds(stall_seconds * 1000)});
     } catch (const std::exception& failure) {
         std::println(stderr, "sysbench: cannot start runtime: {}", failure.what());
         sb::mem::destroy(main_heap, engine);

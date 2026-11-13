@@ -126,7 +126,7 @@ private:
     std::uint64_t m_unique = 0;
 };
 
-constexpr std::uint32_t kMaxBenchmarkThreads = 4096;
+constexpr std::uint32_t kMaxBenchmarkThreads = 16384;
 
 struct RunControl {
     Clock::time_point m_start{};
@@ -2380,7 +2380,7 @@ int LuaEngine::run(Runtime& runtime, const LuaRunOptions& run_options) {
     const auto interval =
         std::chrono::seconds(std::max(1u, run_options.m_report_interval));
     if (run_options.m_report_interval == 0) {
-        runtime.wait();
+        if (!runtime.wait()) return 1;
     } else {
         while (!runtime.wait_for(
             std::chrono::duration_cast<std::chrono::nanoseconds>(interval))) {
@@ -2404,6 +2404,7 @@ int LuaEngine::run(Runtime& runtime, const LuaRunOptions& run_options) {
             previous = current;
             last_report = now;
         }
+        if (runtime.stall_detected()) return 1;
     }
 
     const auto now = Clock::now();
@@ -2435,7 +2436,7 @@ int LuaEngine::run_command(Runtime& runtime, const LuaRunOptions& run_options,
             return impl->run_command_worker(run_options, command, i, &failures);
         });
     }
-    runtime.wait();
+    if (!runtime.wait()) return 1;
     return failures.sum(runtime.worker_count()) == 0 ? 0 : 1;
 }
 
