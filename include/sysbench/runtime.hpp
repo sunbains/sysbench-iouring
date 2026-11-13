@@ -182,7 +182,7 @@ private:
     Config m_config{};
     std::atomic<bool> m_running{false};
     std::atomic<bool> m_stop_requested{false};
-    static constexpr std::uint32_t kMaxThreads = 256;
+    static constexpr std::uint32_t kMaxThreads = 16384;
     struct ThreadSlot {
         std::atomic<std::uintptr_t> m_key{0};
         void* (*m_body)(void*) = nullptr;
