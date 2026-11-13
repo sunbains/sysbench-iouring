@@ -168,8 +168,8 @@ Task<void> connect_accept(std::atomic<bool>& ok) {
 
 TEST("registered buffers are page-backed and exhaustible") {
     Runtime runtime;
-    runtime.start(Runtime::Config{.workers = 1,
-                                  .worker_heap_bytes = 2 * 1024 * 1024});
+    runtime.start(Runtime::Config{.m_workers = 1,
+                                  .m_worker_heap_bytes = 2 * 1024 * 1024});
     std::atomic<bool> registered{false};
     std::atomic<bool> exhaustion{false};
     runtime.spawn(inspect_pool(registered, exhaustion));
@@ -181,8 +181,8 @@ TEST("registered buffers are page-backed and exhaustible") {
 
 TEST("read_fixed/write_fixed roundtrip on a socketpair") {
     Runtime runtime;
-    runtime.start(Runtime::Config{.workers = 1,
-                                  .worker_heap_bytes = 2 * 1024 * 1024});
+    runtime.start(Runtime::Config{.m_workers = 1,
+                                  .m_worker_heap_bytes = 2 * 1024 * 1024});
     std::atomic<bool> ok{false};
     std::atomic<std::uint64_t> ops{0};
     runtime.spawn(socketpair_roundtrip(ok, ops));
@@ -195,8 +195,8 @@ TEST("read_fixed/write_fixed roundtrip on a socketpair") {
 TEST("fixed-buffer I/O throughput") {
     if (!::sb::test::perf_enabled()) return;
     Runtime runtime;
-    runtime.start(Runtime::Config{.workers = 1,
-                                  .worker_heap_bytes = 4 * 1024 * 1024});
+    runtime.start(Runtime::Config{.m_workers = 1,
+                                  .m_worker_heap_bytes = 4 * 1024 * 1024});
     constexpr int kIterations = 10'000;
     std::atomic<bool> ok{false};
     std::atomic<std::uint64_t> ops{0};
@@ -214,8 +214,8 @@ TEST("fixed-buffer I/O throughput") {
 
 TEST("ring connect and accept") {
     Runtime runtime;
-    runtime.start(Runtime::Config{.workers = 1,
-                                  .worker_heap_bytes = 2 * 1024 * 1024});
+    runtime.start(Runtime::Config{.m_workers = 1,
+                                  .m_worker_heap_bytes = 2 * 1024 * 1024});
     std::atomic<bool> ok{false};
     runtime.spawn(connect_accept(ok));
     runtime.wait();

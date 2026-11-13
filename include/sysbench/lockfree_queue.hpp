@@ -37,7 +37,7 @@ class LockFreeQueue {
 public:
     LockFreeQueue() noexcept {
         for (std::size_t i = 0; i < Capacity; ++i) {
-            m_cells[i].sequence.store(i, std::memory_order_relaxed);
+            m_cells[i].m_sequence.store(i, std::memory_order_relaxed);
         }
         m_enqueue_position.store(0, std::memory_order_relaxed);
         m_dequeue_position.store(0, std::memory_order_relaxed);
@@ -51,7 +51,7 @@ public:
         for (;;) {
             Cell& cell = m_cells[position & (Capacity - 1)];
             const std::size_t sequence =
-                cell.sequence.load(std::memory_order_acquire);
+                cell.m_sequence.load(std::memory_order_acquire);
             const std::intptr_t difference =
                 static_cast<std::intptr_t>(sequence) -
                 static_cast<std::intptr_t>(position);
@@ -59,8 +59,8 @@ public:
                 if (m_enqueue_position.compare_exchange_weak(
                         position, position + 1, std::memory_order_relaxed,
                         std::memory_order_relaxed)) {
-                    cell.value = value;
-                    cell.sequence.store(position + 1, std::memory_order_release);
+                    cell.m_value = value;
+                    cell.m_sequence.store(position + 1, std::memory_order_release);
                     return true;
                 }
             } else if (difference < 0) {
@@ -76,7 +76,7 @@ public:
         for (;;) {
             Cell& cell = m_cells[position & (Capacity - 1)];
             const std::size_t sequence =
-                cell.sequence.load(std::memory_order_acquire);
+                cell.m_sequence.load(std::memory_order_acquire);
             const std::intptr_t difference =
                 static_cast<std::intptr_t>(sequence) -
                 static_cast<std::intptr_t>(position + 1);
@@ -84,8 +84,8 @@ public:
                 if (m_dequeue_position.compare_exchange_weak(
                         position, position + 1, std::memory_order_relaxed,
                         std::memory_order_relaxed)) {
-                    value = cell.value;
-                    cell.sequence.store(position + Capacity,
+                    value = cell.m_value;
+                    cell.m_sequence.store(position + Capacity,
                                         std::memory_order_release);
                     return true;
                 }
@@ -104,8 +104,8 @@ public:
 
 private:
     struct Cell {
-        std::atomic<std::size_t> sequence{0};
-        T value{};
+        std::atomic<std::size_t> m_sequence{0};
+        T m_value{};
     };
 
     std::array<Cell, Capacity> m_cells{};

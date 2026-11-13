@@ -143,7 +143,7 @@ double LatencyHistogram::bin_upper_bound_seconds(std::size_t bin) noexcept {
 
 double LatencyHistogram::percentile(double fraction) const {
     const Snapshot current = snapshot();
-    return percentile_from_counts(current.counts, current.total, fraction);
+    return percentile_from_counts(current.m_counts, current.m_total, fraction);
 }
 
 std::uint64_t LatencyHistogram::observations() const noexcept {
@@ -159,15 +159,15 @@ void LatencyHistogram::reset() noexcept {
 void LatencyHistogram::merge(const LatencyHistogram& other) noexcept {
     const Snapshot snapshot = other.snapshot();
     for (std::size_t i = 0; i < m_bins.size(); ++i) {
-        m_bins[i].fetch_add(snapshot.counts[i], std::memory_order_relaxed);
+        m_bins[i].fetch_add(snapshot.m_counts[i], std::memory_order_relaxed);
     }
 }
 
 LatencyHistogram::Snapshot LatencyHistogram::snapshot() const noexcept {
     Snapshot result;
     for (std::size_t i = 0; i < m_bins.size(); ++i) {
-        result.counts[i] = m_bins[i].load(std::memory_order_relaxed);
-        result.total += result.counts[i];
+        result.m_counts[i] = m_bins[i].load(std::memory_order_relaxed);
+        result.m_total += result.m_counts[i];
     }
     return result;
 }
@@ -239,22 +239,22 @@ StatsSnapshot aggregate(std::span<ThreadStats* const> threads, double percentile
     for (ThreadStats* thread : threads) {
         if (thread == nullptr) continue;
         ++thread_count;
-        result.events += thread->events();
-        result.reads += thread->reads();
-        result.writes += thread->writes();
-        result.other += thread->other();
-        result.errors += thread->errors();
-        result.reconnects += thread->reconnects();
-        result.bytes_read += thread->bytes_read();
-        result.bytes_written += thread->bytes_written();
-        result.latency_sum_ns += thread->latency_sum_ns();
+        result.m_events += thread->events();
+        result.m_reads += thread->reads();
+        result.m_writes += thread->writes();
+        result.m_other += thread->other();
+        result.m_errors += thread->errors();
+        result.m_reconnects += thread->reconnects();
+        result.m_bytes_read += thread->bytes_read();
+        result.m_bytes_written += thread->bytes_written();
+        result.m_latency_sum_ns += thread->latency_sum_ns();
         max_latency = std::max(max_latency, thread->latency_max_ns());
         min_latency = std::min(min_latency, thread->latency_min_ns());
-        if (thread->active()) ++result.threads_running;
+        if (thread->active()) ++result.m_threads_running;
 
         const auto hist = thread->histogram();
-        for (std::size_t i = 0; i < counts.size(); ++i) counts[i] += hist.counts[i];
-        timed += hist.total;
+        for (std::size_t i = 0; i < counts.size(); ++i) counts[i] += hist.m_counts[i];
+        timed += hist.m_total;
 
         const auto thread_events = thread->events();
         events_min = std::min(events_min, thread_events);
@@ -265,26 +265,26 @@ StatsSnapshot aggregate(std::span<ThreadStats* const> threads, double percentile
     }
 
     if (thread_count > 0) {
-        result.thread_events_min = events_min == UINT64_MAX ? 0 : events_min;
-        result.thread_events_max = events_max;
-        result.thread_events_avg = events_sum / static_cast<double>(thread_count);
-        const double mean = result.thread_events_avg;
+        result.m_thread_events_min = events_min == UINT64_MAX ? 0 : events_min;
+        result.m_thread_events_max = events_max;
+        result.m_thread_events_avg = events_sum / static_cast<double>(thread_count);
+        const double mean = result.m_thread_events_avg;
         const double variance =
             std::max(0.0, events_squared / static_cast<double>(thread_count) -
                               mean * mean);
-        result.thread_events_stddev = std::sqrt(variance);
-        result.threads_running = result.threads_running == 0 ? 0 : result.threads_running;
+        result.m_thread_events_stddev = std::sqrt(variance);
+        result.m_threads_running = result.m_threads_running == 0 ? 0 : result.m_threads_running;
     }
-    result.histogram = LatencyHistogram::Snapshot{counts, timed};
+    result.m_histogram = LatencyHistogram::Snapshot{counts, timed};
     if (timed > 0) {
-        result.latency_avg = static_cast<double>(result.latency_sum_ns) /
+        result.m_latency_avg = static_cast<double>(result.m_latency_sum_ns) /
                              static_cast<double>(timed) * 1e-9;
-        result.latency_min_ns = min_latency;
-        result.latency_max_ns = max_latency;
-        result.latency_p50 = percentile_from_counts(counts, timed, 0.50);
-        result.latency_p95 = percentile_from_counts(counts, timed, 0.95);
-        result.latency_p99 = percentile_from_counts(counts, timed, 0.99);
-        result.latency_percentile =
+        result.m_latency_min_ns = min_latency;
+        result.m_latency_max_ns = max_latency;
+        result.m_latency_p50 = percentile_from_counts(counts, timed, 0.50);
+        result.m_latency_p95 = percentile_from_counts(counts, timed, 0.95);
+        result.m_latency_p99 = percentile_from_counts(counts, timed, 0.99);
+        result.m_latency_percentile =
             percentile_from_counts(counts, timed, percentile / 100.0);
     }
     return result;
@@ -293,41 +293,41 @@ StatsSnapshot aggregate(std::span<ThreadStats* const> threads, double percentile
 StatsSnapshot StatsSnapshot::difference(const StatsSnapshot& older,
                                         double percentile) const {
     StatsSnapshot result;
-    result.events = events - older.events;
-    result.reads = reads - older.reads;
-    result.writes = writes - older.writes;
-    result.other = other - older.other;
-    result.errors = errors - older.errors;
-    result.reconnects = reconnects - older.reconnects;
-    result.bytes_read = bytes_read - older.bytes_read;
-    result.bytes_written = bytes_written - older.bytes_written;
-    result.latency_sum_ns = latency_sum_ns - older.latency_sum_ns;
-    result.latency_min_ns = latency_min_ns;
-    result.latency_max_ns = latency_max_ns;
+    result.m_events = m_events - older.m_events;
+    result.m_reads = m_reads - older.m_reads;
+    result.m_writes = m_writes - older.m_writes;
+    result.m_other = m_other - older.m_other;
+    result.m_errors = m_errors - older.m_errors;
+    result.m_reconnects = m_reconnects - older.m_reconnects;
+    result.m_bytes_read = m_bytes_read - older.m_bytes_read;
+    result.m_bytes_written = m_bytes_written - older.m_bytes_written;
+    result.m_latency_sum_ns = m_latency_sum_ns - older.m_latency_sum_ns;
+    result.m_latency_min_ns = m_latency_min_ns;
+    result.m_latency_max_ns = m_latency_max_ns;
 
     std::array<std::uint64_t, LatencyHistogram::kBins> counts{};
     std::uint64_t timed = 0;
     for (std::size_t i = 0; i < counts.size(); ++i) {
-        counts[i] = histogram.counts[i] >= older.histogram.counts[i]
-                        ? histogram.counts[i] - older.histogram.counts[i]
+        counts[i] = m_histogram.m_counts[i] >= older.m_histogram.m_counts[i]
+                        ? m_histogram.m_counts[i] - older.m_histogram.m_counts[i]
                         : 0;
         timed += counts[i];
     }
-    result.histogram = LatencyHistogram::Snapshot{counts, timed};
+    result.m_histogram = LatencyHistogram::Snapshot{counts, timed};
     if (timed > 0) {
-        result.latency_avg = static_cast<double>(result.latency_sum_ns) /
+        result.m_latency_avg = static_cast<double>(result.m_latency_sum_ns) /
                              static_cast<double>(timed) * 1e-9;
-        result.latency_p50 = percentile_from_counts(counts, timed, 0.50);
-        result.latency_p95 = percentile_from_counts(counts, timed, 0.95);
-        result.latency_p99 = percentile_from_counts(counts, timed, 0.99);
-        result.latency_percentile =
+        result.m_latency_p50 = percentile_from_counts(counts, timed, 0.50);
+        result.m_latency_p95 = percentile_from_counts(counts, timed, 0.95);
+        result.m_latency_p99 = percentile_from_counts(counts, timed, 0.99);
+        result.m_latency_percentile =
             percentile_from_counts(counts, timed, percentile / 100.0);
     }
-    result.threads_running = threads_running;
-    result.thread_events_min = thread_events_min;
-    result.thread_events_max = thread_events_max;
-    result.thread_events_avg = thread_events_avg;
-    result.thread_events_stddev = thread_events_stddev;
+    result.m_threads_running = m_threads_running;
+    result.m_thread_events_min = m_thread_events_min;
+    result.m_thread_events_max = m_thread_events_max;
+    result.m_thread_events_avg = m_thread_events_avg;
+    result.m_thread_events_stddev = m_thread_events_stddev;
     return result;
 }
 

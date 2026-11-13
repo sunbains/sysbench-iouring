@@ -385,10 +385,10 @@ Task<void> client_flow(std::uint16_t port, std::atomic<int>& stages,
 
     const std::string port_string = std::to_string(port);
     db::ConnectionOptions options;
-    options.host = "127.0.0.1";
-    options.port = port_string;
-    options.user = "bench";
-    options.password = "password";
+    options.m_host = "127.0.0.1";
+    options.m_port = port_string;
+    options.m_user = "bench";
+    options.m_password = "password";
 
     auto connect_result = co_await driver->connect(options, allocator);
     if (connect_result.is_err()) {
@@ -407,12 +407,12 @@ Task<void> client_flow(std::uint16_t port, std::atomic<int>& stages,
             ok.store(false, std::memory_order_relaxed);
         } else {
             const db::ResultSet& rows = result.value();
-            ok.store(rows.has_rows && rows.columns.size() == 1 &&
-                         rows.rows.size() == 1 &&
-                         rows.rows[0].fields.size() == 1 &&
-                         !rows.rows[0].fields[0].is_null &&
-                         std::string_view(rows.rows[0].fields[0].data,
-                                          rows.rows[0].fields[0].length) == "1",
+            ok.store(rows.m_has_rows && rows.m_columns.size() == 1 &&
+                         rows.m_rows.size() == 1 &&
+                         rows.m_rows[0].m_fields.size() == 1 &&
+                         !rows.m_rows[0].m_fields[0].m_is_null &&
+                         std::string_view(rows.m_rows[0].m_fields[0].m_data,
+                                          rows.m_rows[0].m_fields[0].m_length) == "1",
                      std::memory_order_relaxed);
         }
         stages.fetch_add(1);
@@ -424,7 +424,7 @@ Task<void> client_flow(std::uint16_t port, std::atomic<int>& stages,
             ok.store(false, std::memory_order_relaxed);
         } else {
             const db::ResultSet& rows = result.value();
-            ok.store(ok.load() && !rows.has_rows && rows.affected_rows == 1,
+            ok.store(ok.load() && !rows.m_has_rows && rows.m_affected_rows == 1,
                      std::memory_order_relaxed);
         }
         stages.fetch_add(1);
@@ -444,10 +444,10 @@ Task<void> client_flow(std::uint16_t port, std::atomic<int>& stages,
                 ok.store(false, std::memory_order_relaxed);
             } else {
                 const db::ResultSet& rows = result.value();
-                ok.store(ok.load() && rows.has_rows && rows.rows.size() == 1 &&
-                             rows.rows[0].fields.size() == 1 &&
-                             std::string_view(rows.rows[0].fields[0].data,
-                                              rows.rows[0].fields[0].length) == "42",
+                ok.store(ok.load() && rows.m_has_rows && rows.m_rows.size() == 1 &&
+                             rows.m_rows[0].m_fields.size() == 1 &&
+                             std::string_view(rows.m_rows[0].m_fields[0].m_data,
+                                              rows.m_rows[0].m_fields[0].m_length) == "42",
                          std::memory_order_relaxed);
             }
             stages.fetch_add(1);
@@ -471,8 +471,8 @@ TEST("MySQL client handshake, query and prepared statement") {
     mysql::register_driver();
 
     Runtime runtime;
-    runtime.start(Runtime::Config{.workers = 1,
-                                  .worker_heap_bytes = 8 * 1024 * 1024});
+    runtime.start(Runtime::Config{.m_workers = 1,
+                                  .m_worker_heap_bytes = 8 * 1024 * 1024});
     std::atomic<int> stages{0};
     std::atomic<bool> ok{true};
     runtime.spawn(server.run());
@@ -489,8 +489,8 @@ TEST("MySQL caching_sha2 fast auth") {
     mysql::register_driver();
 
     Runtime runtime;
-    runtime.start(Runtime::Config{.workers = 1,
-                                  .worker_heap_bytes = 8 * 1024 * 1024});
+    runtime.start(Runtime::Config{.m_workers = 1,
+                                  .m_worker_heap_bytes = 8 * 1024 * 1024});
     std::atomic<int> stages{0};
     std::atomic<bool> ok{true};
     runtime.spawn(server.run());
@@ -508,8 +508,8 @@ TEST("MySQL query throughput over a local mock server") {
     mysql::register_driver();
 
     Runtime runtime;
-    runtime.start(Runtime::Config{.workers = 2,
-                                  .worker_heap_bytes = 8 * 1024 * 1024});
+    runtime.start(Runtime::Config{.m_workers = 2,
+                                  .m_worker_heap_bytes = 8 * 1024 * 1024});
 
     constexpr int kQueries = 2000;
     std::atomic<int> completed{0};
@@ -519,9 +519,9 @@ TEST("MySQL query throughput over a local mock server") {
         db::Driver* driver = db::DriverRegistry::instance().create("mysql", allocator);
         const std::string port_string = std::to_string(server.port());
         db::ConnectionOptions options;
-        options.host = "127.0.0.1";
-        options.port = port_string;
-        options.user = "bench";
+        options.m_host = "127.0.0.1";
+        options.m_port = port_string;
+        options.m_user = "bench";
         auto connect_result = co_await driver->connect(options, allocator);
         if (connect_result.is_err()) {
             ok.store(false);
@@ -532,8 +532,8 @@ TEST("MySQL query throughput over a local mock server") {
         for (int i = 0; i < kQueries; ++i) {
             mem::ScopedAllocator scope(arena);
             auto result = co_await connection->query("SELECT 1", scope);
-            if (result.is_err() || !result.value().has_rows ||
-                result.value().rows.size() != 1) {
+            if (result.is_err() || !result.value().m_has_rows ||
+                result.value().m_rows.size() != 1) {
                 ok.store(false);
                 break;
             }
@@ -576,10 +576,10 @@ TEST("MySQL concurrent point-select throughput") {
 
     Runtime runtime;
     const bool unpinned = std::getenv("SYSBENCH_UNPINNED") != nullptr;
-    runtime.start(Runtime::Config{.workers = 2 * kPairs,
-                                  .worker_heap_bytes = 8 * 1024 * 1024,
-                                  .pin_workers = !unpinned,
-                                  .numa_aware = !unpinned});
+    runtime.start(Runtime::Config{.m_workers = 2 * kPairs,
+                                  .m_worker_heap_bytes = 8 * 1024 * 1024,
+                                  .m_pin_workers = !unpinned,
+                                  .m_numa_aware = !unpinned});
 
     std::atomic<int> completed{0};
     std::atomic<int> failures{0};
@@ -588,9 +588,9 @@ TEST("MySQL concurrent point-select throughput") {
         db::Driver* driver = db::DriverRegistry::instance().create("mysql", allocator);
         const std::string port_string = std::to_string(port);
         db::ConnectionOptions options;
-        options.host = "127.0.0.1";
-        options.port = port_string;
-        options.user = "bench";
+        options.m_host = "127.0.0.1";
+        options.m_port = port_string;
+        options.m_user = "bench";
         auto connect_result = co_await driver->connect(options, allocator);
         if (connect_result.is_err()) {
             failures.fetch_add(1, std::memory_order_relaxed);
@@ -601,8 +601,8 @@ TEST("MySQL concurrent point-select throughput") {
         for (int i = 0; i < kQueriesPerPair; ++i) {
             mem::ScopedAllocator scope(arena);
             auto result = co_await connection->query("SELECT 1", scope);
-            if (result.is_err() || !result.value().has_rows ||
-                result.value().rows.size() != 1) {
+            if (result.is_err() || !result.value().m_has_rows ||
+                result.value().m_rows.size() != 1) {
                 failures.fetch_add(1, std::memory_order_relaxed);
                 break;
             }

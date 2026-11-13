@@ -31,9 +31,9 @@ inline constexpr std::uint32_t kMaxCpuCount = 4096;
 inline constexpr std::uint32_t kMaxNodeCpus = 1024;
 
 struct NodeInfo {
-    int id = -1;
-    std::uint32_t cpu_count = 0;
-    std::array<std::uint32_t, kMaxNodeCpus> cpus{};
+    int m_id = -1;
+    std::uint32_t m_cpu_count = 0;
+    std::array<std::uint32_t, kMaxNodeCpus> m_cpus{};
 };
 
 class Topology {

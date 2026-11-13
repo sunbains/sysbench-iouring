@@ -28,11 +28,11 @@ namespace sb {
 enum class OptionType : std::uint8_t { Bool, Int, Size, Double, String, List };
 
 struct OptionDef {
-    mem::String name;
-    mem::String description;
-    mem::String value;
-    OptionType type = OptionType::String;
-    bool custom = false;
+    mem::String m_name;
+    mem::String m_description;
+    mem::String m_value;
+    OptionType m_type = OptionType::String;
+    bool m_custom = false;
 
     OptionDef(mem::MemoryResource& resource, std::string_view name,
               std::string_view description, OptionType type,
@@ -44,14 +44,14 @@ struct OptionDef {
 };
 
 struct ParsedArgs {
-    mem::String script_arg;
-    mem::String script_path;
-    mem::String command;
-    int script_index = -1;
-    int command_index = -1;
-    bool help = false;
-    bool version = false;
-    bool valid = false;
+    mem::String m_script_arg;
+    mem::String m_script_path;
+    mem::String m_command;
+    int m_script_index = -1;
+    int m_command_index = -1;
+    bool m_help = false;
+    bool m_version = false;
+    bool m_valid = false;
 };
 
 class Options {

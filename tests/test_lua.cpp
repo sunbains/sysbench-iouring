@@ -275,23 +275,23 @@ private:
 LuaRunOptions make_run_options(std::uint16_t port, std::uint64_t threads,
                                std::uint64_t events, std::uint64_t seconds) {
     LuaRunOptions result;
-    result.threads = static_cast<std::uint32_t>(threads);
-    result.time_seconds = seconds;
-    result.events = events;
-    result.report_interval = 0;
-    result.percentile = 95;
-    result.database.host = "127.0.0.1";
+    result.m_threads = static_cast<std::uint32_t>(threads);
+    result.m_time_seconds = seconds;
+    result.m_events = events;
+    result.m_report_interval = 0;
+    result.m_percentile = 95;
+    result.m_database.m_host = "127.0.0.1";
     static thread_local std::string port_string;
     port_string = std::to_string(port);
-    result.database.port = port_string;
-    result.database.user = "root";
-    result.database.password = "password";
+    result.m_database.m_port = port_string;
+    result.m_database.m_user = "root";
+    result.m_database.m_password = "password";
     return result;
 }
 
 Runtime::Config runtime_config() {
-    return Runtime::Config{.workers = 1,
-                           .worker_heap_bytes = 8 * 1024 * 1024};
+    return Runtime::Config{.m_workers = 1,
+                           .m_worker_heap_bytes = 8 * 1024 * 1024};
 }
 
 }  // namespace
@@ -343,13 +343,13 @@ TEST("Lua SQL allocations stay bounded across events") {
     CHECK(engine.install_options(error));
 
     Runtime runtime;
-    runtime.start(Runtime::Config{.workers = 1,
-                                  .worker_heap_bytes = 8 * 1024 * 1024});
+    runtime.start(Runtime::Config{.m_workers = 1,
+                                  .m_worker_heap_bytes = 8 * 1024 * 1024});
     runtime.spawn(server.run());
     LuaRunOptions run_options = make_run_options(server.port(), 1, 2000, 20);
     CHECK_EQ(engine.run(runtime, run_options), 0);
     const auto stats = runtime.worker_heap_stats(0);
-    CHECK(stats.used < 4 * 1024 * 1024);
+    CHECK(stats.m_used < 4 * 1024 * 1024);
     CHECK_EQ(server.executes(), 2000);
     runtime.shutdown();
 }
@@ -368,10 +368,10 @@ TEST("Lua CPU benchmark and random API") {
     Runtime runtime;
     runtime.start(runtime_config());
     LuaRunOptions run_options;
-    run_options.threads = 2;
-    run_options.events = 1000;
-    run_options.time_seconds = 5;
-    run_options.report_interval = 0;
+    run_options.m_threads = 2;
+    run_options.m_events = 1000;
+    run_options.m_time_seconds = 5;
+    run_options.m_report_interval = 0;
     const int result = engine.run(runtime, run_options);
     runtime.shutdown();
     CHECK_EQ(result, 0);
@@ -416,15 +416,15 @@ TEST("Lua event throughput") {
     CHECK(engine.install_options(error));
 
     Runtime runtime;
-    runtime.start(Runtime::Config{.workers = 4,
-                                  .worker_heap_bytes = 8 * 1024 * 1024});
+    runtime.start(Runtime::Config{.m_workers = 4,
+                                  .m_worker_heap_bytes = 8 * 1024 * 1024});
     LuaRunOptions run_options;
-    run_options.threads = 4;
-    run_options.events = 200'000;
-    run_options.time_seconds = 20;
-    run_options.report_interval = 0;
+    run_options.m_threads = 4;
+    run_options.m_events = 200'000;
+    run_options.m_time_seconds = 20;
+    run_options.m_report_interval = 0;
     const double throughput = ::sb::test::measure_ops_per_second(
-        run_options.events, [&] {
+        run_options.m_events, [&] {
             const int result = engine.run(runtime, run_options);
             CHECK_EQ(result, 0);
         });

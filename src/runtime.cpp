@@ -47,10 +47,10 @@ namespace {
 using Clock = std::chrono::steady_clock;
 
 void append_ready(PromiseBase*& head, PromiseBase*& tail, PromiseBase* task) noexcept {
-    task->next_ready = nullptr;
-    task->in_ready = true;
+    task->m_next_ready = nullptr;
+    task->m_in_ready = true;
     if (tail != nullptr) {
-        tail->next_ready = task;
+        tail->m_next_ready = task;
     } else {
         head = task;
     }
@@ -96,146 +96,146 @@ constexpr std::chrono::microseconds kIdleSpin{50};
 }  // namespace
 
 struct alignas(4096) Runtime::Worker {
-    Runtime* runtime;
-    std::uint32_t id;
-    mem::HeapArena heap;
-    std::thread thread;
+    Runtime* m_runtime;
+    std::uint32_t m_id;
+    mem::HeapArena m_heap;
+    std::thread m_thread;
 
     // Completion handoff: a multi-producer / single-consumer intrusive stack.
     // Producers are reapers and the spawning thread; the only popper is this
     // worker.  ABA cannot occur because only the consumer removes nodes, so a
     // pushed node can never return to the head behind the consumer's back.
-    std::atomic<PromiseBase*> injected{nullptr};
-    std::atomic<bool> waiting{false};
-    int wake_fd = -1;
-    PromiseBase* ready_head = nullptr;
-    PromiseBase* ready_tail = nullptr;
-    PromiseBase* completed_head = nullptr;
-    PromiseBase* deferred_head = nullptr;
-    PromiseBase* timer_head = nullptr;
-    std::atomic<bool> exiting{false};
-    std::atomic<std::uint32_t> pending_io{0};
-    int numa_node = -1;
-    int cpu = -1;
+    std::atomic<PromiseBase*> m_injected{nullptr};
+    std::atomic<bool> m_waiting{false};
+    int m_wake_fd = -1;
+    PromiseBase* m_ready_head = nullptr;
+    PromiseBase* m_ready_tail = nullptr;
+    PromiseBase* m_completed_head = nullptr;
+    PromiseBase* m_deferred_head = nullptr;
+    PromiseBase* m_timer_head = nullptr;
+    std::atomic<bool> m_exiting{false};
+    std::atomic<std::uint32_t> m_pending_io{0};
+    int m_numa_node = -1;
+    int m_cpu = -1;
 
     Worker(Runtime* owner, std::uint32_t worker_id, const Config& config,
            int node, int pinned_cpu)
-        : runtime(owner),
-          id(worker_id),
-          heap(mem::global_root(), config.worker_heap_bytes, "worker", node),
-          numa_node(node),
-          cpu(pinned_cpu) {
-        wake_fd = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-        if (wake_fd < 0) throw std::system_error(errno, std::generic_category(),
+        : m_runtime(owner),
+          m_id(worker_id),
+          m_heap(mem::global_root(), config.m_worker_heap_bytes, "worker", node),
+          m_numa_node(node),
+          m_cpu(pinned_cpu) {
+        m_wake_fd = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+        if (m_wake_fd < 0) throw std::system_error(errno, std::generic_category(),
                                                  "eventfd");
     }
 
     ~Worker() {
-        if (wake_fd >= 0) ::close(wake_fd);
+        if (m_wake_fd >= 0) ::close(m_wake_fd);
     }
 
     Worker(const Worker&) = delete;
     Worker& operator=(const Worker&) = delete;
 
     void signal_wake() noexcept {
-        if (wake_fd < 0) return;
+        if (m_wake_fd < 0) return;
         const std::uint64_t one = 1;
-        const ssize_t ignored = ::write(wake_fd, &one, sizeof(one));
+        const ssize_t ignored = ::write(m_wake_fd, &one, sizeof(one));
         (void)ignored;
     }
 
     void push_ready(PromiseBase* task) noexcept {
-        append_ready(ready_head, ready_tail, task);
+        append_ready(m_ready_head, m_ready_tail, task);
     }
 
     PromiseBase* pop_ready() noexcept {
-        PromiseBase* task = ready_head;
+        PromiseBase* task = m_ready_head;
         if (task != nullptr) {
-            ready_head = task->next_ready;
-            if (ready_head == nullptr) ready_tail = nullptr;
-            task->next_ready = nullptr;
-            task->in_ready = false;
+            m_ready_head = task->m_next_ready;
+            if (m_ready_head == nullptr) m_ready_tail = nullptr;
+            task->m_next_ready = nullptr;
+            task->m_in_ready = false;
         }
         return task;
     }
 
     void push_injected(PromiseBase* task) noexcept {
-        PromiseBase* head = injected.load(std::memory_order_relaxed);
+        PromiseBase* head = m_injected.load(std::memory_order_relaxed);
         do {
-            if (exiting.load(std::memory_order_relaxed)) return;
-            task->next_ready = head;
-        } while (!injected.compare_exchange_weak(
+            if (m_exiting.load(std::memory_order_relaxed)) return;
+            task->m_next_ready = head;
+        } while (!m_injected.compare_exchange_weak(
             head, task, std::memory_order_seq_cst, std::memory_order_relaxed));
         // The stack publish and the `waiting` check must both be seq_cst: a
         // release/acquire pair still permits the store-buffer interleaving
         // where the worker stores waiting=true and loads the empty stack while
         // the producer pushes and loads waiting=false.  That loses the wakeup
         // and parks the worker forever with the task sitting in the stack.
-        if (waiting.load(std::memory_order_seq_cst)) {
+        if (m_waiting.load(std::memory_order_seq_cst)) {
             signal_wake();
         }
     }
 
     void push_completed(PromiseBase* task) noexcept {
-        task->next_completed = completed_head;
-        completed_head = task;
+        task->m_next_completed = m_completed_head;
+        m_completed_head = task;
     }
 
     void push_deferred(PromiseBase* task) noexcept {
-        task->next_deferred = deferred_head;
-        deferred_head = task;
+        task->m_next_deferred = m_deferred_head;
+        m_deferred_head = task;
     }
 
     void process_deferred() noexcept {
-        PromiseBase* task = deferred_head;
-        deferred_head = nullptr;
+        PromiseBase* task = m_deferred_head;
+        m_deferred_head = nullptr;
         while (task != nullptr) {
-            PromiseBase* next = task->next_deferred;
-            task->next_deferred = nullptr;
-            task->self.destroy();
+            PromiseBase* next = task->m_next_deferred;
+            task->m_next_deferred = nullptr;
+            task->m_self.destroy();
             task = next;
         }
     }
 
 
     void add_timer(PromiseBase* task) noexcept {
-        task->timer_queued = true;
-        PromiseBase** link = &timer_head;
-        while (*link != nullptr && (*link)->wake_at <= task->wake_at) {
-            link = &(*link)->next_timer;
+        task->m_timer_queued = true;
+        PromiseBase** link = &m_timer_head;
+        while (*link != nullptr && (*link)->m_wake_at <= task->m_wake_at) {
+            link = &(*link)->m_next_timer;
         }
-        task->next_timer = *link;
+        task->m_next_timer = *link;
         *link = task;
     }
 
     void activate_due_timers() noexcept {
         const auto now = Clock::now();
-        while (timer_head != nullptr && timer_head->wake_at <= now) {
-            PromiseBase* task = timer_head;
-            timer_head = task->next_timer;
-            task->next_timer = nullptr;
-            task->timer_queued = false;
+        while (m_timer_head != nullptr && m_timer_head->m_wake_at <= now) {
+            PromiseBase* task = m_timer_head;
+            m_timer_head = task->m_next_timer;
+            task->m_next_timer = nullptr;
+            task->m_timer_queued = false;
             push_ready(task);
         }
     }
 
     void drain_injected() noexcept {
-        PromiseBase* list = injected.exchange(nullptr, std::memory_order_acquire);
+        PromiseBase* list = m_injected.exchange(nullptr, std::memory_order_acquire);
         while (list != nullptr) {
-            PromiseBase* next = list->next_ready;
+            PromiseBase* next = list->m_next_ready;
             push_ready(list);
             list = next;
         }
     }
 
     void process_completed() noexcept {
-        PromiseBase* task = completed_head;
-        completed_head = nullptr;
+        PromiseBase* task = m_completed_head;
+        m_completed_head = nullptr;
         while (task != nullptr) {
-            PromiseBase* next = task->next_completed;
-            task->next_completed = nullptr;
-            task->self.destroy();
-            runtime->finish_task();
+            PromiseBase* next = task->m_next_completed;
+            task->m_next_completed = nullptr;
+            task->m_self.destroy();
+            m_runtime->finish_task();
             task = next;
         }
     }
@@ -243,22 +243,22 @@ struct alignas(4096) Runtime::Worker {
     void resume(PromiseBase* task) noexcept {
         detail::tls_worker = this;
         detail::tls_current = task;
-        task->self.resume();
+        task->m_self.resume();
         detail::tls_current = nullptr;
-        runtime->m_resumes.add(id, 1);
+        m_runtime->m_resumes.add(m_id, 1);
     }
 
     void wait_for_work() {
         const auto now = Clock::now();
-        if (timer_head != nullptr && timer_head->wake_at <= now) return;
+        if (m_timer_head != nullptr && m_timer_head->m_wake_at <= now) return;
 
-        if (pending_io.load(std::memory_order_acquire) != 0 &&
-            runtime->undersubscribed()) {
+        if (m_pending_io.load(std::memory_order_acquire) != 0 &&
+            m_runtime->undersubscribed()) {
             const auto deadline = Clock::now() + kIdleSpin;
             std::uint32_t spins = 0;
             for (;;) {
-                if (injected.load(std::memory_order_acquire) != nullptr ||
-                    exiting.load(std::memory_order_acquire)) {
+                if (m_injected.load(std::memory_order_acquire) != nullptr ||
+                    m_exiting.load(std::memory_order_acquire)) {
                     return;
                 }
                 // The wake sequence is checked on every pass so completion
@@ -270,66 +270,66 @@ struct alignas(4096) Runtime::Worker {
             }
         }
 
-        waiting.store(true, std::memory_order_seq_cst);
-        if (injected.load(std::memory_order_seq_cst) != nullptr ||
-            exiting.load(std::memory_order_acquire)) {
-            waiting.store(false, std::memory_order_seq_cst);
+        m_waiting.store(true, std::memory_order_seq_cst);
+        if (m_injected.load(std::memory_order_seq_cst) != nullptr ||
+            m_exiting.load(std::memory_order_acquire)) {
+            m_waiting.store(false, std::memory_order_seq_cst);
             return;
         }
 
         int timeout_ms = -1;
-        if (timer_head != nullptr) {
+        if (m_timer_head != nullptr) {
             const auto timer_now = Clock::now();
-            if (timer_head->wake_at <= timer_now) {
-                waiting.store(false, std::memory_order_seq_cst);
+            if (m_timer_head->m_wake_at <= timer_now) {
+                m_waiting.store(false, std::memory_order_seq_cst);
                 return;
             }
             const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
-                timer_head->wake_at - timer_now);
+                m_timer_head->m_wake_at - timer_now);
             timeout_ms = static_cast<int>(std::max<std::int64_t>(1, remaining.count()));
         }
 
-        pollfd descriptor{.fd = wake_fd, .events = POLLIN, .revents = 0};
+        pollfd descriptor{.fd = m_wake_fd, .events = POLLIN, .revents = 0};
         const int result = ::poll(&descriptor, 1, timeout_ms);
-        waiting.store(false, std::memory_order_release);
+        m_waiting.store(false, std::memory_order_release);
         if (result > 0 && (descriptor.revents & POLLIN) != 0) {
             std::uint64_t counter = 0;
-            const ssize_t ignored = ::read(wake_fd, &counter, sizeof(counter));
+            const ssize_t ignored = ::read(m_wake_fd, &counter, sizeof(counter));
             (void)ignored;
         }
     }
 
     void request_exit() noexcept {
-        exiting.store(true, std::memory_order_release);
+        m_exiting.store(true, std::memory_order_release);
         signal_wake();
     }
 
     void run() noexcept {
         detail::tls_worker = this;
-        mem::set_thread_frame_node(numa_node >= 0 ? numa_node : 0);
-        if (numa_node >= 0) {
-            (void)numa::set_preferred(numa_node);
+        mem::set_thread_frame_node(m_numa_node >= 0 ? m_numa_node : 0);
+        if (m_numa_node >= 0) {
+            (void)numa::set_preferred(m_numa_node);
         }
-        set_thread_name(numa_node >= 0 ? "sb-worker-n" : "sb-worker");
-        if (runtime->m_config.pin_workers) {
-            if (numa_node >= 0) {
+        set_thread_name(m_numa_node >= 0 ? "sb-worker-n" : "sb-worker");
+        if (m_runtime->m_config.m_pin_workers) {
+            if (m_numa_node >= 0) {
                 const numa::Topology& topology = numa::Topology::instance();
-                const numa::NodeInfo* info = topology.node_by_id(numa_node);
+                const numa::NodeInfo* info = topology.node_by_id(m_numa_node);
                 if (info != nullptr) {
                     cpu_set_t set;
                     CPU_ZERO(&set);
-                    for (std::uint32_t slot = 0; slot < info->cpu_count; ++slot) {
-                        const int candidate = static_cast<int>(info->cpus[slot]);
+                    for (std::uint32_t slot = 0; slot < info->m_cpu_count; ++slot) {
+                        const int candidate = static_cast<int>(info->m_cpus[slot]);
                         if (candidate != topology.reserved_cpu()) {
                             CPU_SET(candidate, &set);
                         }
                     }
                     (void)::pthread_setaffinity_np(::pthread_self(), sizeof(set), &set);
                 }
-            } else if (cpu >= 0) {
-                set_thread_affinity(static_cast<std::uint32_t>(cpu));
+            } else if (m_cpu >= 0) {
+                set_thread_affinity(static_cast<std::uint32_t>(m_cpu));
             } else {
-                set_thread_affinity(runtime->m_config.first_cpu + id);
+                set_thread_affinity(m_runtime->m_config.m_first_cpu + m_id);
             }
         }
 
@@ -344,7 +344,7 @@ struct alignas(4096) Runtime::Worker {
                 continue;
             }
 
-            if (exiting.load(std::memory_order_acquire)) break;
+            if (m_exiting.load(std::memory_order_acquire)) break;
             wait_for_work();
         }
 
@@ -363,16 +363,16 @@ void Runtime::start() {
 void Runtime::start(const Config& config_input) {
     Config config = config_input;
     if (m_workers != nullptr) throw std::logic_error("runtime already started");
-    if (config.workers == 0) config.workers = hardware_workers();
-    if (config.workers == 0) config.workers = 1;
-    if (config.workers > kMaxWorkers) {
+    if (config.m_workers == 0) config.m_workers = hardware_workers();
+    if (config.m_workers == 0) config.m_workers = 1;
+    if (config.m_workers > kMaxWorkers) {
         std::println(stderr, "sysbench: worker count capped at {} (requested {})",
-                     kMaxWorkers, config.workers);
-        config.workers = kMaxWorkers;
+                     kMaxWorkers, config.m_workers);
+        config.m_workers = kMaxWorkers;
     }
-    if (config.worker_heap_bytes < 1024 * 1024) config.worker_heap_bytes = 1024 * 1024;
+    if (config.m_worker_heap_bytes < 1024 * 1024) config.m_worker_heap_bytes = 1024 * 1024;
     m_config = config;
-    m_worker_count = config.workers;
+    m_worker_count = config.m_workers;
     m_wait_event_fd = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     if (m_wait_event_fd < 0) {
         m_worker_count = 0;
@@ -384,7 +384,7 @@ void Runtime::start(const Config& config_input) {
     m_workers = static_cast<Worker*>(m_worker_storage);
 
     const numa::Topology& topology = numa::Topology::instance();
-    const bool use_numa = m_config.numa_aware && topology.available();
+    const bool use_numa = m_config.m_numa_aware && topology.available();
 
     std::uint32_t constructed = 0;
     try {
@@ -417,10 +417,10 @@ void Runtime::start(const Config& config_input) {
     std::uint32_t started = 0;
     try {
         for (; started < m_worker_count; ++started) {
-            if (use_numa && m_workers[started].numa_node >= 0) {
-                (void)numa::set_preferred(m_workers[started].numa_node);
+            if (use_numa && m_workers[started].m_numa_node >= 0) {
+                (void)numa::set_preferred(m_workers[started].m_numa_node);
             }
-            m_workers[started].thread = std::thread([worker = &m_workers[started]] {
+            m_workers[started].m_thread = std::thread([worker = &m_workers[started]] {
                 worker->run();
             });
             if (use_numa) (void)numa::set_preferred(topology.home_node());
@@ -428,7 +428,7 @@ void Runtime::start(const Config& config_input) {
     } catch (...) {
         for (std::uint32_t i = 0; i < started; ++i) m_workers[i].request_exit();
         for (std::uint32_t i = 0; i < started; ++i) {
-            if (m_workers[i].thread.joinable()) m_workers[i].thread.join();
+            if (m_workers[i].m_thread.joinable()) m_workers[i].m_thread.join();
         }
         for (std::uint32_t i = m_worker_count; i > 0; --i) m_workers[i - 1].~Worker();
         mem::global_root().deallocate(m_worker_storage,
@@ -458,7 +458,7 @@ void Runtime::shutdown() {
     m_running.store(false, std::memory_order_release);
     for (std::uint32_t i = 0; i < m_worker_count; ++i) m_workers[i].request_exit();
     for (std::uint32_t i = 0; i < m_worker_count; ++i) {
-        if (m_workers[i].thread.joinable()) m_workers[i].thread.join();
+        if (m_workers[i].m_thread.joinable()) m_workers[i].m_thread.join();
     }
     for (std::uint32_t i = m_worker_count; i > 0; --i) m_workers[i - 1].~Worker();
     mem::global_root().deallocate(m_worker_storage,
@@ -471,13 +471,13 @@ void Runtime::shutdown() {
     // Ask any remaining runtime-owned threads to stop, then join them.  Worker
     // threads are already joined, so no new threads can be registered now.
     for (ThreadSlot& slot : m_thread_slots) {
-        if (slot.key.load(std::memory_order_acquire) == 0) continue;
-        if (slot.stop != nullptr) slot.stop(slot.argument);
+        if (slot.m_key.load(std::memory_order_acquire) == 0) continue;
+        if (slot.m_stop != nullptr) slot.m_stop(slot.m_argument);
     }
     for (ThreadSlot& slot : m_thread_slots) {
-        if (slot.key.load(std::memory_order_acquire) == 0) continue;
-        if (slot.thread.joinable()) slot.thread.join();
-        slot.key.store(0, std::memory_order_release);
+        if (slot.m_key.load(std::memory_order_acquire) == 0) continue;
+        if (slot.m_thread.joinable()) slot.m_thread.join();
+        slot.m_key.store(0, std::memory_order_release);
     }
 
     if (m_wait_event_fd >= 0) {
@@ -508,9 +508,9 @@ void Runtime::spawn_on(std::uint32_t worker, Task<void>&& task) {
     if (!handle) throw std::invalid_argument("spawning an empty task");
 
     PromiseBase* promise = &handle.promise();
-    promise->on_complete = &complete_top_level;
-    promise->started = true;
-    promise->owner_worker = worker;
+    promise->m_on_complete = &complete_top_level;
+    promise->m_started = true;
+    promise->m_owner_worker = worker;
     m_outstanding.add(worker, 1);
     const std::uint32_t active = m_active_tasks.fetch_add(1, std::memory_order_relaxed) + 1;
     m_undersubscribed.store(active <= m_worker_count, std::memory_order_relaxed);
@@ -529,19 +529,19 @@ std::uint32_t Runtime::choose_worker() noexcept {
 
 int Runtime::spawn_numa_node(std::uint32_t worker) const {
     if (m_workers == nullptr || worker >= m_worker_count) return -1;
-    return m_workers[worker].numa_node;
+    return m_workers[worker].m_numa_node;
 }
 
 void Runtime::note_io_submitted() noexcept {
     auto* worker = static_cast<Worker*>(detail::tls_worker);
-    if (worker != nullptr) worker->pending_io.fetch_add(1, std::memory_order_relaxed);
+    if (worker != nullptr) worker->m_pending_io.fetch_add(1, std::memory_order_relaxed);
 }
 
 void Runtime::note_io_completed(std::uint32_t worker) noexcept {
     if (m_workers == nullptr || worker >= m_worker_count) return;
     // Release so a worker that reads zero pending operations is guaranteed to
     // observe the completion that was posted just before the decrement.
-    m_workers[worker].pending_io.fetch_sub(1, std::memory_order_release);
+    m_workers[worker].m_pending_io.fetch_sub(1, std::memory_order_release);
 }
 
 void Runtime::post_completion(std::uint32_t worker,
@@ -554,18 +554,18 @@ void Runtime::post_completion(std::uint32_t worker,
 }
 
 bool Runtime::start_thread(const ThreadSpec& spec) {
-    if (spec.key == nullptr || spec.body == nullptr) return false;
-    const std::uintptr_t key = reinterpret_cast<std::uintptr_t>(spec.key);
+    if (spec.m_key == nullptr || spec.m_body == nullptr) return false;
+    const std::uintptr_t key = reinterpret_cast<std::uintptr_t>(spec.m_key);
     for (ThreadSlot& slot : m_thread_slots) {
         std::uintptr_t expected = 0;
-        if (!slot.key.compare_exchange_strong(expected, key,
+        if (!slot.m_key.compare_exchange_strong(expected, key,
                                               std::memory_order_acq_rel)) {
             continue;
         }
-        slot.body = spec.body;
-        slot.stop = spec.stop;
-        slot.argument = spec.argument;
-        slot.thread = std::thread([&slot] { (void)slot.body(slot.argument); });
+        slot.m_body = spec.m_body;
+        slot.m_stop = spec.m_stop;
+        slot.m_argument = spec.m_argument;
+        slot.m_thread = std::thread([&slot] { (void)slot.m_body(slot.m_argument); });
         return true;
     }
     return false;
@@ -574,25 +574,25 @@ bool Runtime::start_thread(const ThreadSpec& spec) {
 void Runtime::join_thread(const void* key) {
     const std::uintptr_t wanted = reinterpret_cast<std::uintptr_t>(key);
     for (ThreadSlot& slot : m_thread_slots) {
-        if (slot.key.load(std::memory_order_acquire) != wanted) continue;
-        if (slot.thread.joinable()) slot.thread.join();
-        slot.key.store(0, std::memory_order_release);
+        if (slot.m_key.load(std::memory_order_acquire) != wanted) continue;
+        if (slot.m_thread.joinable()) slot.m_thread.join();
+        slot.m_key.store(0, std::memory_order_release);
         return;
     }
 }
 
 bool Runtime::start_reaper(IoReaper& reaper) {
     ThreadSpec spec;
-    spec.key = &reaper;
-    spec.body = [](void* context) -> void* {
+    spec.m_key = &reaper;
+    spec.m_body = [](void* context) -> void* {
         auto* target = static_cast<IoReaper*>(context);
         target->runtime().reaper_loop(*target);
         return nullptr;
     };
-    spec.stop = [](void* context) {
+    spec.m_stop = [](void* context) {
         static_cast<IoReaper*>(context)->request_stop();
     };
-    spec.argument = &reaper;
+    spec.m_argument = &reaper;
     return start_thread(spec);
 }
 
@@ -631,7 +631,7 @@ void Runtime::reaper_loop(IoReaper& reaper) noexcept {
 
 void Runtime::finish_task() noexcept {
     auto* worker = static_cast<Worker*>(detail::tls_worker);
-    const std::uint32_t worker_id = worker != nullptr ? worker->id : 0;
+    const std::uint32_t worker_id = worker != nullptr ? worker->m_id : 0;
     m_outstanding.add(worker_id, -1);
     const std::uint32_t active = m_active_tasks.fetch_sub(1, std::memory_order_relaxed) - 1;
     m_undersubscribed.store(active <= m_worker_count, std::memory_order_relaxed);
@@ -679,30 +679,30 @@ mem::MemoryResource& Runtime::worker_allocator(std::uint32_t worker) {
     if (m_workers == nullptr || worker >= m_worker_count) {
         throw std::out_of_range("worker id");
     }
-    return m_workers[worker].heap;
+    return m_workers[worker].m_heap;
 }
 
 mem::ResourceStats Runtime::worker_heap_stats(std::uint32_t worker) const {
     if (m_workers == nullptr || worker >= m_worker_count) {
         throw std::out_of_range("worker id");
     }
-    return m_workers[worker].heap.stats();
+    return m_workers[worker].m_heap.stats();
 }
 
 Runtime* Runtime::current() noexcept {
     auto* worker = static_cast<Worker*>(detail::tls_worker);
-    return worker != nullptr ? worker->runtime : nullptr;
+    return worker != nullptr ? worker->m_runtime : nullptr;
 }
 
 std::uint32_t Runtime::current_worker_id() noexcept {
     auto* worker = static_cast<Worker*>(detail::tls_worker);
-    return worker != nullptr ? worker->id : 0;
+    return worker != nullptr ? worker->m_id : 0;
 }
 
 mem::MemoryResource& Runtime::current_allocator() {
     auto* worker = static_cast<Worker*>(detail::tls_worker);
     if (worker == nullptr) throw std::logic_error("not running on a runtime worker");
-    return worker->heap;
+    return worker->m_heap;
 }
 
 
@@ -719,14 +719,14 @@ int Runtime::worker_numa_node(std::uint32_t worker) const {
     if (m_workers == nullptr || worker >= m_worker_count) {
         throw std::out_of_range("worker id");
     }
-    return m_workers[worker].numa_node;
+    return m_workers[worker].m_numa_node;
 }
 
 int Runtime::worker_cpu(std::uint32_t worker) const {
     if (m_workers == nullptr || worker >= m_worker_count) {
         throw std::out_of_range("worker id");
     }
-    return m_workers[worker].cpu;
+    return m_workers[worker].m_cpu;
 }
 
 std::uint32_t Runtime::hardware_workers() noexcept {
@@ -756,14 +756,14 @@ void sleep_current(std::chrono::nanoseconds duration) noexcept {
         worker->push_ready(task);
         return;
     }
-    task->wake_at = std::chrono::steady_clock::now() + duration;
+    task->m_wake_at = std::chrono::steady_clock::now() + duration;
     worker->add_timer(task);
 }
 
 void defer_destroy(PromiseBase* task) noexcept {
     auto* worker = static_cast<Runtime::Worker*>(tls_worker);
     if (worker == nullptr) {
-        task->self.destroy();
+        task->m_self.destroy();
         return;
     }
     worker->push_deferred(task);

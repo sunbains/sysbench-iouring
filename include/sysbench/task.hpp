@@ -39,20 +39,20 @@ struct PromiseBase;
 using CompleteFn = void (*)(PromiseBase*) noexcept;
 
 struct PromiseBase {
-    std::coroutine_handle<> self{};
-    PromiseBase* continuation = nullptr;
-    PromiseBase* next_ready = nullptr;
-    PromiseBase* next_completed = nullptr;
-    PromiseBase* next_timer = nullptr;
-    PromiseBase* next_deferred = nullptr;
-    CompleteFn on_complete = nullptr;
-    std::exception_ptr error;
-    std::chrono::steady_clock::time_point wake_at{};
-    std::uint32_t owner_worker = 0;
-    bool in_ready = false;
-    bool timer_queued = false;
-    bool awaited = false;
-    bool started = false;
+    std::coroutine_handle<> m_self{};
+    PromiseBase* m_continuation = nullptr;
+    PromiseBase* m_next_ready = nullptr;
+    PromiseBase* m_next_completed = nullptr;
+    PromiseBase* m_next_timer = nullptr;
+    PromiseBase* m_next_deferred = nullptr;
+    CompleteFn m_on_complete = nullptr;
+    std::exception_ptr m_error;
+    std::chrono::steady_clock::time_point m_wake_at{};
+    std::uint32_t m_owner_worker = 0;
+    bool m_in_ready = false;
+    bool m_timer_queued = false;
+    bool m_awaited = false;
+    bool m_started = false;
 };
 
 extern thread_local PromiseBase* tls_current;
@@ -69,14 +69,14 @@ struct FinalAwaiter {
     template <class Promise>
     std::coroutine_handle<> await_suspend(std::coroutine_handle<Promise> handle) noexcept {
         PromiseBase& promise = handle.promise();
-        if (promise.continuation != nullptr) {
-            PromiseBase* continuation = promise.continuation;
-            promise.continuation = nullptr;
+        if (promise.m_continuation != nullptr) {
+            PromiseBase* continuation = promise.m_continuation;
+            promise.m_continuation = nullptr;
             tls_current = continuation;
-            return continuation->self;
+            return continuation->m_self;
         }
-        if (promise.on_complete != nullptr) {
-            promise.on_complete(&promise);
+        if (promise.m_on_complete != nullptr) {
+            promise.m_on_complete(&promise);
         }
         return std::noop_coroutine();
     }
@@ -104,8 +104,8 @@ public:
         PromiseBase* parent = tls_current;
         if (parent == nullptr) no_runtime();
         PromiseBase& child = m_handle.promise();
-        child.continuation = parent;
-        child.started = true;
+        child.m_continuation = parent;
+        child.m_started = true;
         tls_current = &child;
         // Symmetric transfer: start the child in this resume instead of
         // queueing it for another scheduler iteration.  A MySQL query nests
@@ -117,15 +117,15 @@ public:
 
     decltype(auto) await_resume() {
         auto& promise = m_handle.promise();
-        if (promise.error) {
-            std::exception_ptr error = promise.error;
+        if (promise.m_error) {
+            std::exception_ptr error = promise.m_error;
             detail::defer_destroy(&promise);
             m_handle = {};
             std::rethrow_exception(error);
         }
         using Value = typename T::Value;
         if constexpr (!std::is_void_v<Value>) {
-            Value value = std::move(*promise.value);
+            Value value = std::move(*promise.m_value);
             detail::defer_destroy(&promise);
             m_handle = {};
             return value;
@@ -144,11 +144,11 @@ class Task {
 public:
     struct promise_type final : PromiseBase {
         using Value = T;
-        std::optional<T> value;
+        std::optional<T> m_value;
 
         Task get_return_object() noexcept {
             auto handle = std::coroutine_handle<promise_type>::from_promise(*this);
-            this->self = handle;
+            m_self = handle;
             return Task(handle);
         }
 
@@ -156,11 +156,11 @@ public:
         FinalAwaiter final_suspend() const noexcept { return {}; }
 
         void return_value(T result) {
-            value.emplace(std::move(result));
+            m_value.emplace(std::move(result));
         }
 
         void unhandled_exception() noexcept {
-            this->error = std::current_exception();
+            m_error = std::current_exception();
         }
 
         static void* operator new(std::size_t size) {
@@ -181,7 +181,7 @@ public:
     Task(Task&& other) noexcept : m_handle(std::exchange(other.m_handle, {})) {}
     Task& operator=(Task&& other) noexcept {
         if (this != &other) {
-            if (m_handle && !m_handle.promise().started) m_handle.destroy();
+            if (m_handle && !m_handle.promise().m_started) m_handle.destroy();
             m_handle = std::exchange(other.m_handle, {});
         }
         return *this;
@@ -190,13 +190,13 @@ public:
     Task& operator=(const Task&) = delete;
 
     ~Task() {
-        if (m_handle && !m_handle.promise().started) m_handle.destroy();
+        if (m_handle && !m_handle.promise().m_started) m_handle.destroy();
     }
 
     [[nodiscard]] bool valid() const noexcept { return static_cast<bool>(m_handle); }
     [[nodiscard]] Handle release() noexcept { return std::exchange(m_handle, {}); }
     [[nodiscard]] TaskAwaiter<promise_type> operator co_await() && noexcept {
-        m_handle.promise().awaited = true;
+        m_handle.promise().m_awaited = true;
         return TaskAwaiter<promise_type>(release());
     }
 
@@ -211,7 +211,7 @@ public:
         using Value = void;
         Task get_return_object() noexcept {
             auto handle = std::coroutine_handle<promise_type>::from_promise(*this);
-            this->self = handle;
+            m_self = handle;
             return Task(handle);
         }
 
@@ -219,7 +219,7 @@ public:
         FinalAwaiter final_suspend() const noexcept { return {}; }
         void return_void() const noexcept {}
         void unhandled_exception() noexcept {
-            this->error = std::current_exception();
+            m_error = std::current_exception();
         }
 
         static void* operator new(std::size_t size) {
@@ -240,7 +240,7 @@ public:
     Task(Task&& other) noexcept : m_handle(std::exchange(other.m_handle, {})) {}
     Task& operator=(Task&& other) noexcept {
         if (this != &other) {
-            if (m_handle && !m_handle.promise().started) m_handle.destroy();
+            if (m_handle && !m_handle.promise().m_started) m_handle.destroy();
             m_handle = std::exchange(other.m_handle, {});
         }
         return *this;
@@ -249,13 +249,13 @@ public:
     Task& operator=(const Task&) = delete;
 
     ~Task() {
-        if (m_handle && !m_handle.promise().started) m_handle.destroy();
+        if (m_handle && !m_handle.promise().m_started) m_handle.destroy();
     }
 
     [[nodiscard]] bool valid() const noexcept { return static_cast<bool>(m_handle); }
     [[nodiscard]] Handle release() noexcept { return std::exchange(m_handle, {}); }
     [[nodiscard]] TaskAwaiter<promise_type> operator co_await() && noexcept {
-        m_handle.promise().awaited = true;
+        m_handle.promise().m_awaited = true;
         return TaskAwaiter<promise_type>(release());
     }
 
@@ -273,13 +273,13 @@ struct YieldAwaiter {
 };
 
 struct SleepAwaiter {
-    std::chrono::nanoseconds duration;
+    std::chrono::nanoseconds m_duration;
 
     [[nodiscard]] bool await_ready() const noexcept {
-        return duration <= std::chrono::nanoseconds::zero();
+        return m_duration <= std::chrono::nanoseconds::zero();
     }
     void await_suspend(std::coroutine_handle<>) const noexcept {
-        sleep_current(duration);
+        sleep_current(m_duration);
     }
     void await_resume() const noexcept {}
 };

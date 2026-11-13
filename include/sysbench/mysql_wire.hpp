@@ -89,47 +89,47 @@ inline constexpr std::uint8_t TYPE_GEOMETRY = 255;
 inline constexpr std::uint16_t UNSIGNED_FLAG = 0x0020;
 
 struct Handshake {
-    std::uint32_t capabilities = 0;
-    std::uint32_t connection_id = 0;
-    std::uint32_t max_packet = 0;
-    std::uint16_t status = 0;
-    std::uint8_t charset = 0;
-    std::array<std::uint8_t, 20> scramble{};
-    std::size_t scramble_length = 0;
-    char server_version[128]{};
-    std::size_t server_version_length = 0;
-    char auth_plugin[64] = "mysql_native_password";
-    std::size_t auth_plugin_length = 16;
+    std::uint32_t m_capabilities = 0;
+    std::uint32_t m_connection_id = 0;
+    std::uint32_t m_max_packet = 0;
+    std::uint16_t m_status = 0;
+    std::uint8_t m_charset = 0;
+    std::array<std::uint8_t, 20> m_scramble{};
+    std::size_t m_scramble_length = 0;
+    char m_server_version[128]{};
+    std::size_t m_server_version_length = 0;
+    char m_auth_plugin[64] = "mysql_native_password";
+    std::size_t m_auth_plugin_length = 16;
 };
 
 struct PacketHeader {
-    std::uint32_t length = 0;
-    std::uint8_t sequence = 0;
+    std::uint32_t m_length = 0;
+    std::uint8_t m_sequence = 0;
 };
 
 struct OkPacket {
-    std::uint64_t affected_rows = 0;
-    std::uint64_t last_insert_id = 0;
-    std::uint16_t status = 0;
-    std::uint16_t warnings = 0;
+    std::uint64_t m_affected_rows = 0;
+    std::uint64_t m_last_insert_id = 0;
+    std::uint16_t m_status = 0;
+    std::uint16_t m_warnings = 0;
 };
 
 struct EofPacket {
-    std::uint16_t warnings = 0;
-    std::uint16_t status = 0;
+    std::uint16_t m_warnings = 0;
+    std::uint16_t m_status = 0;
 };
 
 struct ErrorPacket {
-    std::uint16_t code = 0;
-    char state[6] = "HY000";
-    std::string_view message;
+    std::uint16_t m_code = 0;
+    char m_state[6] = "HY000";
+    std::string_view m_message;
 };
 
 struct PrepareOk {
-    std::uint32_t statement_id = 0;
-    std::uint16_t columns = 0;
-    std::uint16_t parameters = 0;
-    std::uint16_t warnings = 0;
+    std::uint32_t m_statement_id = 0;
+    std::uint16_t m_columns = 0;
+    std::uint16_t m_parameters = 0;
+    std::uint16_t m_warnings = 0;
 };
 
 class Reader {

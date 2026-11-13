@@ -70,7 +70,7 @@ TEST("page ranges bind to their NUMA node before first touch") {
     if (!topology.available() || topology.node_count() < 2) return;
     mem::RootArena root(32 * 1024 * 1024);
     for (std::uint32_t index = 0; index < topology.node_count(); ++index) {
-        const int node = topology.node(index).id;
+        const int node = topology.node(index).m_id;
         void* memory = root.allocate(2 * 1024 * 1024, 4096);
         REQUIRE(memory != nullptr);
         CHECK(numa::bind_range(memory, 2 * 1024 * 1024, node));
@@ -87,7 +87,7 @@ TEST("heap and frame allocation are node-local") {
     if (!topology.available() || topology.node_count() < 2) return;
     mem::RootArena root(32 * 1024 * 1024);
     for (std::uint32_t index = 0; index < topology.node_count(); ++index) {
-        const int node = topology.node(index).id;
+        const int node = topology.node(index).m_id;
         mem::HeapArena heap(root, 4 * 1024 * 1024, "numa-test", node);
         if (!heap.numa_bound()) {
             std::println("  mbind unavailable; skipping node-local assertions");
@@ -111,11 +111,11 @@ TEST("runtime caps workers at 64 and keeps each on one NUMA node") {
         mem::GlobalAllocator::instance().initialize(1024ull * 1024 * 1024);
     }
     Runtime runtime;
-    runtime.start(Runtime::Config{.workers = 100,
-                                  .worker_heap_bytes = 1024 * 1024,
-                                  .pin_workers = true,
-                                  .numa_aware = true,
-                                  .first_cpu = 0});
+    runtime.start(Runtime::Config{.m_workers = 100,
+                                  .m_worker_heap_bytes = 1024 * 1024,
+                                  .m_pin_workers = true,
+                                  .m_numa_aware = true,
+                                  .m_first_cpu = 0});
     CHECK_EQ(runtime.worker_count(), Runtime::kMaxWorkers);
     const numa::Topology& topology = numa::Topology::instance();
     for (std::uint32_t worker = 0; worker < runtime.worker_count(); ++worker) {

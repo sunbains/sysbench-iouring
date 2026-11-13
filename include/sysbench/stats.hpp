@@ -47,8 +47,8 @@ public:
     [[nodiscard]] static double bin_upper_bound_seconds(std::size_t bin) noexcept;
 
     struct Snapshot {
-        std::array<std::uint64_t, kBins> counts{};
-        std::uint64_t total = 0;
+        std::array<std::uint64_t, kBins> m_counts{};
+        std::uint64_t m_total = 0;
     };
     [[nodiscard]] Snapshot snapshot() const noexcept;
 
@@ -137,35 +137,35 @@ private:
 };
 
 struct StatsSnapshot {
-    std::uint64_t events = 0;
-    std::uint64_t reads = 0;
-    std::uint64_t writes = 0;
-    std::uint64_t other = 0;
-    std::uint64_t errors = 0;
-    std::uint64_t reconnects = 0;
-    std::uint64_t bytes_read = 0;
-    std::uint64_t bytes_written = 0;
-    std::uint64_t latency_sum_ns = 0;
-    std::uint64_t latency_min_ns = 0;
-    std::uint64_t latency_max_ns = 0;
-    double latency_avg = 0.0;
-    double latency_p50 = 0.0;
-    double latency_p95 = 0.0;
-    double latency_p99 = 0.0;
-    double latency_percentile = 0.0;
-    std::uint64_t threads_running = 0;
-    std::uint64_t thread_events_min = 0;
-    std::uint64_t thread_events_max = 0;
-    double thread_events_avg = 0.0;
-    double thread_events_stddev = 0.0;
-    LatencyHistogram::Snapshot histogram{};
+    std::uint64_t m_events = 0;
+    std::uint64_t m_reads = 0;
+    std::uint64_t m_writes = 0;
+    std::uint64_t m_other = 0;
+    std::uint64_t m_errors = 0;
+    std::uint64_t m_reconnects = 0;
+    std::uint64_t m_bytes_read = 0;
+    std::uint64_t m_bytes_written = 0;
+    std::uint64_t m_latency_sum_ns = 0;
+    std::uint64_t m_latency_min_ns = 0;
+    std::uint64_t m_latency_max_ns = 0;
+    double m_latency_avg = 0.0;
+    double m_latency_p50 = 0.0;
+    double m_latency_p95 = 0.0;
+    double m_latency_p99 = 0.0;
+    double m_latency_percentile = 0.0;
+    std::uint64_t m_threads_running = 0;
+    std::uint64_t m_thread_events_min = 0;
+    std::uint64_t m_thread_events_max = 0;
+    double m_thread_events_avg = 0.0;
+    double m_thread_events_stddev = 0.0;
+    LatencyHistogram::Snapshot m_histogram{};
 
     [[nodiscard]] double events_per_second(double interval) const noexcept {
-        return interval > 0.0 ? static_cast<double>(events) / interval : 0.0;
+        return interval > 0.0 ? static_cast<double>(m_events) / interval : 0.0;
     }
     [[nodiscard]] double queries_per_second(double interval) const noexcept {
         return interval > 0.0
-                   ? static_cast<double>(reads + writes + other) / interval
+                   ? static_cast<double>(m_reads + m_writes + m_other) / interval
                    : 0.0;
     }
 

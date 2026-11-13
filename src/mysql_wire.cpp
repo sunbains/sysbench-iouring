@@ -107,7 +107,7 @@ bool binary_date(Reader& reader, db::Row& row, mem::MemoryResource& resource,
     std::uint8_t length = 0;
     if (!reader.u8(length)) return false;
     if (length == 0) {
-        row.fields.push_back(text_field(resource,
+        row.m_fields.push_back(text_field(resource,
                                         time_only ? "00:00:00" : "0000-00-00 00:00:00"));
         return true;
     }
@@ -127,7 +127,7 @@ bool binary_date(Reader& reader, db::Row& row, mem::MemoryResource& resource,
             }
             const std::uint64_t total_hours =
                 static_cast<std::uint64_t>(days) * 24u + hour;
-            row.fields.push_back(formatted_field(
+            row.m_fields.push_back(formatted_field(
                 resource, "%s%02llu:%02u:%02u", negative != 0 ? "-" : "",
                 static_cast<unsigned long long>(total_hours),
                 static_cast<unsigned>(minute), static_cast<unsigned>(second)));
@@ -136,7 +136,7 @@ bool binary_date(Reader& reader, db::Row& row, mem::MemoryResource& resource,
                 if (!reader.u32(micros)) return false;
             }
         } else {
-            row.fields.push_back(text_field(resource, "00:00:00"));
+            row.m_fields.push_back(text_field(resource, "00:00:00"));
         }
         return true;
     }
@@ -149,11 +149,11 @@ bool binary_date(Reader& reader, db::Row& row, mem::MemoryResource& resource,
         if (!reader.u8(hour) || !reader.u8(minute) || !reader.u8(second)) return false;
     }
     if (has_time) {
-        row.fields.push_back(formatted_field(
+        row.m_fields.push_back(formatted_field(
             resource, "%04u-%02u-%02u %02u:%02u:%02u", year, month, day, hour,
             minute, second));
     } else {
-        row.fields.push_back(
+        row.m_fields.push_back(
             formatted_field(resource, "%04u-%02u-%02u", year, month, day));
     }
     if (length == 11) {
@@ -346,8 +346,8 @@ bool parse_packet_header(std::span<const std::byte> data, PacketHeader& header) 
         static_cast<std::uint32_t>(std::to_integer<std::uint8_t>(data[0])) |
         (static_cast<std::uint32_t>(std::to_integer<std::uint8_t>(data[1])) << 8) |
         (static_cast<std::uint32_t>(std::to_integer<std::uint8_t>(data[2])) << 16);
-    header.length = length;
-    header.sequence = std::to_integer<std::uint8_t>(data[3]);
+    header.m_length = length;
+    header.m_sequence = std::to_integer<std::uint8_t>(data[3]);
     return true;
 }
 
@@ -373,10 +373,10 @@ bool parse_handshake(std::span<const std::byte> payload, Handshake& handshake) n
     std::string_view version;
     if (!reader.u8(protocol) || protocol != 10) return false;
     if (reader.null_terminated(version) != Reader::StringResult::Ok) return false;
-    copy_string(handshake.server_version, sizeof(handshake.server_version), version,
-                handshake.server_version_length);
+    copy_string(handshake.m_server_version, sizeof(handshake.m_server_version), version,
+                handshake.m_server_version_length);
 
-    if (!reader.u32(handshake.connection_id)) return false;
+    if (!reader.u32(handshake.m_connection_id)) return false;
     std::span<const std::byte> auth1;
     if (!reader.take(8, auth1)) return false;
     std::uint8_t filler = 0;
@@ -385,22 +385,22 @@ bool parse_handshake(std::span<const std::byte> payload, Handshake& handshake) n
     std::uint16_t capability_low = 0;
     if (!reader.u16(capability_low)) return false;
     if (reader.remaining() == 0) {
-        handshake.capabilities = capability_low;
+        handshake.m_capabilities = capability_low;
         return true;
     }
 
-    if (!reader.u8(handshake.charset)) return false;
-    if (!reader.u16(handshake.status)) return false;
+    if (!reader.u8(handshake.m_charset)) return false;
+    if (!reader.u16(handshake.m_status)) return false;
     std::uint16_t capability_high = 0;
     if (!reader.u16(capability_high)) return false;
-    handshake.capabilities = capability_low |
+    handshake.m_capabilities = capability_low |
                              (static_cast<std::uint32_t>(capability_high) << 16);
     if (!reader.u8(reinterpret_cast<std::uint8_t&>(filler))) return false;  // auth length
     const std::size_t auth_length = filler;
     if (!reader.skip(10)) return false;
 
     const std::size_t part2_length =
-        handshake.capabilities & CLIENT_SECURE_CONNECTION
+        handshake.m_capabilities & CLIENT_SECURE_CONNECTION
             ? std::max<std::size_t>(13, auth_length > 8 ? auth_length - 8 : 0)
             : 0;
     std::span<const std::byte> auth2;
@@ -409,24 +409,24 @@ bool parse_handshake(std::span<const std::byte> payload, Handshake& handshake) n
 
     std::size_t scramble_length = 0;
     for (std::byte byte : auth1) {
-        if (scramble_length < handshake.scramble.size()) {
-            handshake.scramble[scramble_length++] =
+        if (scramble_length < handshake.m_scramble.size()) {
+            handshake.m_scramble[scramble_length++] =
                 std::to_integer<std::uint8_t>(byte);
         }
     }
     for (std::byte byte : auth2) {
-        if (scramble_length >= handshake.scramble.size()) break;
+        if (scramble_length >= handshake.m_scramble.size()) break;
         const std::uint8_t value = std::to_integer<std::uint8_t>(byte);
         if (value == 0) break;
-        handshake.scramble[scramble_length++] = value;
+        handshake.m_scramble[scramble_length++] = value;
     }
-    handshake.scramble_length = scramble_length;
+    handshake.m_scramble_length = scramble_length;
 
-    if (handshake.capabilities & CLIENT_PLUGIN_AUTH) {
+    if (handshake.m_capabilities & CLIENT_PLUGIN_AUTH) {
         std::string_view plugin;
         if (reader.null_terminated(plugin) == Reader::StringResult::Ok && !plugin.empty()) {
-            copy_string(handshake.auth_plugin, sizeof(handshake.auth_plugin), plugin,
-                        handshake.auth_plugin_length);
+            copy_string(handshake.m_auth_plugin, sizeof(handshake.m_auth_plugin), plugin,
+                        handshake.m_auth_plugin_length);
         }
     }
     return true;
@@ -439,10 +439,10 @@ bool parse_ok(std::span<const std::byte> payload, OkPacket& packet) noexcept {
     Reader reader(payload);
     std::uint8_t ignored = 0;
     if (!reader.u8(ignored)) return false;
-    if (!reader.lenenc(packet.affected_rows)) return false;
-    if (!reader.lenenc(packet.last_insert_id)) return false;
-    if (!reader.u16(packet.status)) return false;
-    if (!reader.u16(packet.warnings)) return false;
+    if (!reader.lenenc(packet.m_affected_rows)) return false;
+    if (!reader.lenenc(packet.m_last_insert_id)) return false;
+    if (!reader.u16(packet.m_status)) return false;
+    if (!reader.u16(packet.m_warnings)) return false;
     return true;
 }
 
@@ -453,8 +453,8 @@ bool parse_eof(std::span<const std::byte> payload, EofPacket& packet) noexcept {
     Reader reader(payload);
     std::uint8_t ignored = 0;
     if (!reader.u8(ignored)) return false;
-    if (reader.remaining() >= 2) (void)reader.u16(packet.warnings);
-    if (reader.remaining() >= 2) (void)reader.u16(packet.status);
+    if (reader.remaining() >= 2) (void)reader.u16(packet.m_warnings);
+    if (reader.remaining() >= 2) (void)reader.u16(packet.m_status);
     return true;
 }
 
@@ -465,19 +465,19 @@ bool parse_error(std::span<const std::byte> payload, ErrorPacket& packet) noexce
     Reader reader(payload);
     std::uint8_t ignored = 0;
     if (!reader.u8(ignored)) return false;
-    if (!reader.u16(packet.code)) return false;
+    if (!reader.u16(packet.m_code)) return false;
     std::uint8_t next = 0;
     if (reader.peek_u8(next) && next == '#') {
         (void)reader.u8(next);
         std::span<const std::byte> state;
         if (!reader.take(5, state)) return false;
         for (std::size_t i = 0; i < 5; ++i) {
-            packet.state[i] = static_cast<char>(std::to_integer<std::uint8_t>(state[i]));
+            packet.m_state[i] = static_cast<char>(std::to_integer<std::uint8_t>(state[i]));
         }
-        packet.state[5] = '\0';
+        packet.m_state[5] = '\0';
     }
     const auto remaining = reader.remaining_data();
-    packet.message = {reinterpret_cast<const char*>(remaining.data()), remaining.size()};
+    packet.m_message = {reinterpret_cast<const char*>(remaining.data()), remaining.size()};
     return true;
 }
 
@@ -486,11 +486,11 @@ bool parse_prepare_ok(std::span<const std::byte> payload, PrepareOk& packet) noe
     Reader reader(payload);
     std::uint8_t ignored = 0;
     if (!reader.u8(ignored)) return false;
-    if (!reader.u32(packet.statement_id)) return false;
-    if (!reader.u16(packet.columns)) return false;
-    if (!reader.u16(packet.parameters)) return false;
+    if (!reader.u32(packet.m_statement_id)) return false;
+    if (!reader.u16(packet.m_columns)) return false;
+    if (!reader.u16(packet.m_parameters)) return false;
     if (!reader.u8(ignored)) return false;
-    if (!reader.u16(packet.warnings)) return false;
+    if (!reader.u16(packet.m_warnings)) return false;
     return true;
 }
 
@@ -512,15 +512,15 @@ bool parse_column(std::span<const std::byte> payload, db::Column& column) noexce
     if (!reader.lenenc(fixed_length)) return false;
     std::uint16_t charset = 0;
     if (!reader.u16(charset)) return false;
-    column.charset = charset;
+    column.m_charset = charset;
     std::uint32_t column_length = 0;
     if (!reader.u32(column_length)) return false;
-    if (!reader.u8(column.type)) return false;
-    if (!reader.u16(column.flags)) return false;
+    if (!reader.u8(column.m_type)) return false;
+    if (!reader.u16(column.m_flags)) return false;
     std::uint8_t decimals = 0;
     if (!reader.u8(decimals)) return false;
     if (!reader.skip(2)) return false;
-    column.name = name;
+    column.m_name = name;
     return true;
 }
 
@@ -641,11 +641,11 @@ std::uint32_t client_capabilities(const Handshake& handshake,
                                  CLIENT_PROTOCOL_41 | CLIENT_TRANSACTIONS |
                                  CLIENT_SECURE_CONNECTION | CLIENT_MULTI_RESULTS |
                                  CLIENT_PS_MULTI_RESULTS;
-    if (!options.database.empty()) capabilities |= CLIENT_CONNECT_WITH_DB;
-    if (handshake.capabilities & CLIENT_PLUGIN_AUTH) {
+    if (!options.m_database.empty()) capabilities |= CLIENT_CONNECT_WITH_DB;
+    if (handshake.m_capabilities & CLIENT_PLUGIN_AUTH) {
         capabilities |= CLIENT_PLUGIN_AUTH;
     }
-    if (handshake.capabilities & CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA) {
+    if (handshake.m_capabilities & CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA) {
         capabilities |= CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA;
     }
     if (ssl) capabilities |= CLIENT_SSL;
@@ -675,13 +675,13 @@ Bytes build_handshake_response(const Handshake& handshake,
         client_capabilities(handshake, options, ssl);
 
     Bytes payload = make_bytes(resource);
-    payload.reserve(128 + auth_response.size() + options.user.size());
+    payload.reserve(128 + auth_response.size() + options.m_user.size());
     Writer writer(payload);
     writer.u32(capabilities);
     writer.u32(16 * 1024 * 1024);
     writer.u8(45);  // utf8mb4_general_ci
     writer.zeros(23);
-    writer.null_terminated(options.user);
+    writer.null_terminated(options.m_user);
 
     if (capabilities & CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA) {
         writer.lenenc(auth_response.size());
@@ -695,7 +695,7 @@ Bytes build_handshake_response(const Handshake& handshake,
     }
 
     if (capabilities & CLIENT_CONNECT_WITH_DB) {
-        writer.null_terminated(options.database);
+        writer.null_terminated(options.m_database);
     }
     if (capabilities & CLIENT_PLUGIN_AUTH) {
         writer.null_terminated(plugin);
@@ -710,16 +710,16 @@ Bytes build_handshake_response(const Handshake& handshake,
 bool parse_text_row(std::span<const std::byte> payload, std::size_t column_count,
                     mem::MemoryResource& resource, db::Row& row) {
     (void)resource;
-    row.fields.clear();
-    row.fields.reserve(column_count);
+    row.m_fields.clear();
+    row.m_fields.reserve(column_count);
     Reader reader(payload);
     for (std::size_t i = 0; i < column_count; ++i) {
         std::string_view value;
         const auto result = reader.lenenc_string(value);
         if (result == Reader::StringResult::Null) {
-            row.fields.push_back(db::Field{});
+            row.m_fields.push_back(db::Field{});
         } else if (result == Reader::StringResult::Ok) {
-            row.fields.push_back(db::Field{value.data(),
+            row.m_fields.push_back(db::Field{value.data(),
                                            static_cast<std::uint32_t>(value.size()),
                                            false});
         } else {
@@ -743,8 +743,8 @@ bool parse_binary_row(std::span<const std::byte> payload,
     std::span<const std::byte> bitmap;
     if (!reader.take(bitmap_length, bitmap)) return false;
 
-    row.fields.clear();
-    row.fields.reserve(columns.size());
+    row.m_fields.clear();
+    row.m_fields.reserve(columns.size());
 
     auto is_null = [&](std::size_t index) {
         const std::size_t bit = index + 2;
@@ -754,17 +754,17 @@ bool parse_binary_row(std::span<const std::byte> payload,
 
     for (std::size_t i = 0; i < columns.size(); ++i) {
         const db::Column& column = columns[i];
-        if (is_null(i) || column.type == TYPE_NULL) {
-            row.fields.push_back(db::Field{});
+        if (is_null(i) || column.m_type == TYPE_NULL) {
+            row.m_fields.push_back(db::Field{});
             continue;
         }
-        const bool is_unsigned = (column.flags & UNSIGNED_FLAG) != 0;
-        switch (column.type) {
+        const bool is_unsigned = (column.m_flags & UNSIGNED_FLAG) != 0;
+        switch (column.m_type) {
             case TYPE_TINY: {
                 std::uint8_t raw = 0;
                 if (!reader.u8(raw)) return false;
-                if (is_unsigned) row.fields.push_back(formatted_field(resource, "%u", raw));
-                else row.fields.push_back(
+                if (is_unsigned) row.m_fields.push_back(formatted_field(resource, "%u", raw));
+                else row.m_fields.push_back(
                     formatted_field(resource, "%d", static_cast<int>(static_cast<std::int8_t>(raw))));
                 break;
             }
@@ -772,10 +772,10 @@ bool parse_binary_row(std::span<const std::byte> payload,
             case TYPE_YEAR: {
                 std::uint16_t raw = 0;
                 if (!reader.u16(raw)) return false;
-                if (is_unsigned || column.type == TYPE_YEAR)
-                    row.fields.push_back(formatted_field(resource, "%u", raw));
+                if (is_unsigned || column.m_type == TYPE_YEAR)
+                    row.m_fields.push_back(formatted_field(resource, "%u", raw));
                 else
-                    row.fields.push_back(
+                    row.m_fields.push_back(
                         formatted_field(resource, "%d", static_cast<std::int16_t>(raw)));
                 break;
             }
@@ -783,9 +783,9 @@ bool parse_binary_row(std::span<const std::byte> payload,
             case TYPE_INT24: {
                 std::uint32_t raw = 0;
                 if (!reader.u32(raw)) return false;
-                if (is_unsigned) row.fields.push_back(formatted_field(resource, "%u", raw));
+                if (is_unsigned) row.m_fields.push_back(formatted_field(resource, "%u", raw));
                 else
-                    row.fields.push_back(
+                    row.m_fields.push_back(
                         formatted_field(resource, "%d", static_cast<std::int32_t>(raw)));
                 break;
             }
@@ -793,10 +793,10 @@ bool parse_binary_row(std::span<const std::byte> payload,
                 std::uint64_t raw = 0;
                 if (!reader.u64(raw)) return false;
                 if (is_unsigned)
-                    row.fields.push_back(formatted_field(resource, "%llu",
+                    row.m_fields.push_back(formatted_field(resource, "%llu",
                                                          static_cast<unsigned long long>(raw)));
                 else
-                    row.fields.push_back(formatted_field(resource, "%lld",
+                    row.m_fields.push_back(formatted_field(resource, "%lld",
                                                          static_cast<long long>(raw)));
                 break;
             }
@@ -804,7 +804,7 @@ bool parse_binary_row(std::span<const std::byte> payload,
                 std::uint32_t raw = 0;
                 if (!reader.u32(raw)) return false;
                 const float value = std::bit_cast<float>(raw);
-                row.fields.push_back(formatted_field(resource, "%.9g",
+                row.m_fields.push_back(formatted_field(resource, "%.9g",
                                                      static_cast<double>(value)));
                 break;
             }
@@ -812,7 +812,7 @@ bool parse_binary_row(std::span<const std::byte> payload,
                 std::uint64_t raw = 0;
                 if (!reader.u64(raw)) return false;
                 const double value = std::bit_cast<double>(raw);
-                row.fields.push_back(formatted_field(resource, "%.17g", value));
+                row.m_fields.push_back(formatted_field(resource, "%.17g", value));
                 break;
             }
             case TYPE_DATE:
@@ -845,7 +845,7 @@ bool parse_binary_row(std::span<const std::byte> payload,
                 if (reader.lenenc_string(value) != Reader::StringResult::Ok) {
                     return false;
                 }
-                row.fields.push_back(db::Field{value.data(),
+                row.m_fields.push_back(db::Field{value.data(),
                                                static_cast<std::uint32_t>(value.size()),
                                                false});
                 break;
@@ -871,14 +871,14 @@ void build_stmt_execute_payload(Bytes& out, std::uint32_t statement_id,
     const std::size_t bitmap_start = out.size();
     writer.zeros(bitmap_length);
     for (std::size_t i = 0; i < parameters.size(); ++i) {
-        if (parameters[i].kind == db::BindKind::Null) {
+        if (parameters[i].m_kind == db::BindKind::Null) {
             out[bitmap_start + i / 8] |= static_cast<std::byte>(1u << (i % 8));
         }
     }
     writer.u8(1);  // new params bound
 
     for (const auto& parameter : parameters) {
-        switch (parameter.kind) {
+        switch (parameter.m_kind) {
             case db::BindKind::Null:
                 writer.u8(TYPE_NULL);
                 writer.u8(0);
@@ -899,18 +899,18 @@ void build_stmt_execute_payload(Bytes& out, std::uint32_t statement_id,
     }
 
     for (const auto& parameter : parameters) {
-        switch (parameter.kind) {
+        switch (parameter.m_kind) {
             case db::BindKind::Null:
                 break;
             case db::BindKind::Integer:
-                writer.u64(static_cast<std::uint64_t>(parameter.integer));
+                writer.u64(static_cast<std::uint64_t>(parameter.m_integer));
                 break;
             case db::BindKind::Real:
-                writer.u64(std::bit_cast<std::uint64_t>(parameter.real));
+                writer.u64(std::bit_cast<std::uint64_t>(parameter.m_real));
                 break;
             case db::BindKind::Bytes:
-                writer.lenenc(parameter.bytes.size());
-                writer.bytes(parameter.bytes);
+                writer.lenenc(parameter.m_bytes.size());
+                writer.bytes(parameter.m_bytes);
                 break;
         }
     }

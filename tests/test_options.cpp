@@ -67,8 +67,8 @@ TEST("first and second pass CLI parsing") {
     ParsedArgs parsed;
     mem::String error{mem::Allocator<char>(&heap)};
     CHECK(options.scan_arguments(argc, args, parsed, error));
-    CHECK_EQ(std::string_view(parsed.script_arg), "tests/test_options.cpp");
-    CHECK_EQ(std::string_view(parsed.command), "run");
+    CHECK_EQ(std::string_view(parsed.m_script_arg), "tests/test_options.cpp");
+    CHECK_EQ(std::string_view(parsed.m_command), "run");
     CHECK(!options.set("table-size", "1000", error));
 
     CHECK(options.add("table-size", "Rows per table", OptionType::Int, "10000", true));
@@ -108,14 +108,14 @@ TEST("help, version and errors") {
         char* args[4]{};
         ParsedArgs parsed;
         CHECK(options.scan_arguments(make_args(args, values, 2), args, parsed, error));
-        CHECK(parsed.help);
+        CHECK(parsed.m_help);
     }
     {
         const char* values[] = {"sysbench", "--version"};
         char* args[4]{};
         ParsedArgs parsed;
         CHECK(options.scan_arguments(make_args(args, values, 2), args, parsed, error));
-        CHECK(parsed.version);
+        CHECK(parsed.m_version);
     }
     {
         const char* values[] = {"sysbench"};

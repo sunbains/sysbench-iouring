@@ -39,6 +39,7 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <span>
 #include <string_view>
 
@@ -69,10 +70,10 @@ public:
     Task<void> connect(const db::ConnectionOptions& options) {
         close();
 
-        if (!options.socket_path.empty() ||
-            (!options.host.empty() && options.host.front() == '/')) {
+        if (!options.m_socket_path.empty() ||
+            (!options.m_host.empty() && options.m_host.front() == '/')) {
             const std::string_view path =
-                !options.socket_path.empty() ? options.socket_path : options.host;
+                !options.m_socket_path.empty() ? options.m_socket_path : options.m_host;
             if (path.size() >= sizeof(sockaddr_un::sun_path)) {
                 throw db::Error("MySQL socket path too long", 2002);
             }
@@ -98,10 +99,10 @@ public:
 
         char host[256]{};
         char port[32]{};
-        const std::size_t host_length = std::min(options.host.size(), sizeof(host) - 1);
-        const std::size_t port_length = std::min(options.port.size(), sizeof(port) - 1);
-        std::memcpy(host, options.host.data(), host_length);
-        std::memcpy(port, options.port.data(), port_length);
+        const std::size_t host_length = std::min(options.m_host.size(), sizeof(host) - 1);
+        const std::size_t port_length = std::min(options.m_port.size(), sizeof(port) - 1);
+        std::memcpy(host, options.m_host.data(), host_length);
+        std::memcpy(port, options.m_port.data(), port_length);
         if (host_length == 0) std::memcpy(host, "127.0.0.1", 10);
 
         addrinfo hints{};
@@ -152,13 +153,13 @@ public:
         if (context == nullptr) throw tls_failure("SSL_CTX_new");
         SSL_CTX_set_min_proto_version(context, TLS1_2_VERSION);
         SSL_CTX_set_options(context, SSL_OP_NO_COMPRESSION);
-        if (options.tls_verify_server_cert) {
+        if (options.m_tls_verify_server_cert) {
             SSL_CTX_set_verify(context, SSL_VERIFY_PEER, nullptr);
-            if (!options.tls_ca.empty()) {
+            if (!options.m_tls_ca.empty()) {
                 char ca[4096]{};
                 const std::size_t length =
-                    std::min(options.tls_ca.size(), sizeof(ca) - 1);
-                std::memcpy(ca, options.tls_ca.data(), length);
+                    std::min(options.m_tls_ca.size(), sizeof(ca) - 1);
+                std::memcpy(ca, options.m_tls_ca.data(), length);
                 if (SSL_CTX_load_verify_locations(context, ca, nullptr) != 1) {
                     SSL_CTX_free(context);
                     throw tls_failure("SSL_CTX_load_verify_locations");
@@ -184,9 +185,9 @@ public:
                 throw db::Error("invalid MySQL TLS client identity", 2026);
             }
         };
-        load_identity(options.tls_cert, true);
-        load_identity(options.tls_key, false);
-        if (!options.tls_cert.empty() && !options.tls_key.empty() &&
+        load_identity(options.m_tls_cert, true);
+        load_identity(options.m_tls_key, false);
+        if (!options.m_tls_cert.empty() && !options.m_tls_key.empty() &&
             SSL_CTX_check_private_key(context) != 1) {
             SSL_CTX_free(context);
             throw db::Error("MySQL TLS client key does not match certificate", 2026);
@@ -212,8 +213,8 @@ public:
         SSL_set_connect_state(ssl);
 
         char host[256]{};
-        const std::size_t host_length = std::min(options.host.size(), sizeof(host) - 1);
-        std::memcpy(host, options.host.data(), host_length);
+        const std::size_t host_length = std::min(options.m_host.size(), sizeof(host) - 1);
+        std::memcpy(host, options.m_host.data(), host_length);
         const bool is_path = host[0] == '/';
         in_addr ipv4{};
         in6_addr ipv6{};
@@ -223,7 +224,7 @@ public:
         if (!is_path && !is_ip && host_length != 0) {
             (void)SSL_set_tlsext_host_name(ssl, host);
         }
-        if (options.tls_verify_server_cert) {
+        if (options.m_tls_verify_server_cert) {
             if (is_ip) {
                 if (X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(ssl), verify_host) != 1) {
                     SSL_free(ssl);
@@ -330,19 +331,19 @@ public:
         if (!parse_packet_header(header, parsed)) {
             throw db::Error("malformed MySQL packet header", 2027);
         }
-        if (parsed.sequence != m_sequence) {
+        if (parsed.m_sequence != m_sequence) {
             throw db::Error("unexpected MySQL packet sequence", 2027);
         }
         ++m_sequence;
-        if (parsed.length == 0x00ffffff) {
+        if (parsed.m_length == 0x00ffffff) {
             throw db::Error("MySQL packets larger than 16 MiB are unsupported", 2027);
         }
-        if (parsed.length == 0) {
+        if (parsed.m_length == 0) {
             co_return std::span<const std::byte>();
         }
-        auto* memory = static_cast<std::byte*>(resource.allocate(parsed.length, 1));
-        co_await read_exact(memory, parsed.length);
-        co_return std::span<const std::byte>(memory, parsed.length);
+        auto* memory = static_cast<std::byte*>(resource.allocate(parsed.m_length, 1));
+        co_await read_exact(memory, parsed.m_length);
+        co_return std::span<const std::byte>(memory, parsed.m_length);
     }
 
     void close() noexcept {
@@ -579,62 +580,62 @@ private:
 class MysqlConnection;
 
 struct OwnedOptions {
-    mem::String host;
-    mem::String port;
-    mem::String user;
-    mem::String password;
-    mem::String database;
-    mem::String socket_path;
-    mem::String tls_ca;
-    mem::String tls_cert;
-    mem::String tls_key;
+    mem::String m_host;
+    mem::String m_port;
+    mem::String m_user;
+    mem::String m_password;
+    mem::String m_database;
+    mem::String m_socket_path;
+    mem::String m_tls_ca;
+    mem::String m_tls_cert;
+    mem::String m_tls_key;
 
     OwnedOptions(const db::ConnectionOptions& source, mem::MemoryResource& resource)
-        : host(mem::Allocator<char>(&resource)),
-          port(mem::Allocator<char>(&resource)),
-          user(mem::Allocator<char>(&resource)),
-          password(mem::Allocator<char>(&resource)),
-          database(mem::Allocator<char>(&resource)),
-          socket_path(mem::Allocator<char>(&resource)),
-          tls_ca(mem::Allocator<char>(&resource)),
-          tls_cert(mem::Allocator<char>(&resource)),
-          tls_key(mem::Allocator<char>(&resource)),
-          connect_timeout_ms(source.connect_timeout_ms),
-          max_packet_size(source.max_packet_size),
-          tls_mode(source.tls_mode),
-          tls_verify_server_cert(source.tls_verify_server_cert) {
-        host.assign(source.host);
-        port.assign(source.port);
-        user.assign(source.user);
-        password.assign(source.password);
-        database.assign(source.database);
-        socket_path.assign(source.socket_path);
-        tls_ca.assign(source.tls_ca);
-        tls_cert.assign(source.tls_cert);
-        tls_key.assign(source.tls_key);
+        : m_host(mem::Allocator<char>(&resource)),
+          m_port(mem::Allocator<char>(&resource)),
+          m_user(mem::Allocator<char>(&resource)),
+          m_password(mem::Allocator<char>(&resource)),
+          m_database(mem::Allocator<char>(&resource)),
+          m_socket_path(mem::Allocator<char>(&resource)),
+          m_tls_ca(mem::Allocator<char>(&resource)),
+          m_tls_cert(mem::Allocator<char>(&resource)),
+          m_tls_key(mem::Allocator<char>(&resource)),
+          m_connect_timeout_ms(source.m_connect_timeout_ms),
+          m_max_packet_size(source.m_max_packet_size),
+          m_tls_mode(source.m_tls_mode),
+          m_tls_verify_server_cert(source.m_tls_verify_server_cert) {
+        m_host.assign(source.m_host);
+        m_port.assign(source.m_port);
+        m_user.assign(source.m_user);
+        m_password.assign(source.m_password);
+        m_database.assign(source.m_database);
+        m_socket_path.assign(source.m_socket_path);
+        m_tls_ca.assign(source.m_tls_ca);
+        m_tls_cert.assign(source.m_tls_cert);
+        m_tls_key.assign(source.m_tls_key);
     }
 
     [[nodiscard]] db::ConnectionOptions view() const noexcept {
         return db::ConnectionOptions{
-            .host = host,
-            .port = port,
-            .user = user,
-            .password = password,
-            .database = database,
-            .socket_path = socket_path,
-            .connect_timeout_ms = connect_timeout_ms,
-            .max_packet_size = max_packet_size,
-            .tls_mode = tls_mode,
-            .tls_verify_server_cert = tls_verify_server_cert,
-            .tls_ca = tls_ca,
-            .tls_cert = tls_cert,
-            .tls_key = tls_key};
+            .m_host = m_host,
+            .m_port = m_port,
+            .m_user = m_user,
+            .m_password = m_password,
+            .m_database = m_database,
+            .m_socket_path = m_socket_path,
+            .m_connect_timeout_ms = m_connect_timeout_ms,
+            .m_max_packet_size = m_max_packet_size,
+            .m_tls_mode = m_tls_mode,
+            .m_tls_verify_server_cert = m_tls_verify_server_cert,
+            .m_tls_ca = m_tls_ca,
+            .m_tls_cert = m_tls_cert,
+            .m_tls_key = m_tls_key};
     }
 
-    std::uint32_t connect_timeout_ms;
-    std::uint32_t max_packet_size;
-    db::TlsMode tls_mode;
-    bool tls_verify_server_cert;
+    std::uint32_t m_connect_timeout_ms;
+    std::uint32_t m_max_packet_size;
+    db::TlsMode m_tls_mode;
+    bool m_tls_verify_server_cert;
 };
 
 class MysqlStatement final : public db::PreparedStatement {
@@ -655,7 +656,7 @@ public:
     [[nodiscard]] std::uint16_t parameter_count() const noexcept { return m_parameters; }
 
     void destroy(mem::MemoryResource& resource) noexcept override {
-        this->~MysqlStatement();
+        std::destroy_at(this);
         resource.deallocate(this, sizeof(*this), alignof(MysqlStatement));
     }
 
@@ -738,33 +739,33 @@ public:
             // MySQL 8 refuses a handful of commands in the prepared protocol
             // (notably BEGIN/COMMIT).  Keep the Lua statement API intact by
             // executing those as text commands.
-            if (error.code == 1295 && sql.find('?') == std::string_view::npos) {
+            if (error.m_code == 1295 && sql.find('?') == std::string_view::npos) {
                 auto* fallback = mem::construct<MysqlStatement>(
                     *m_persistent, *this, *m_persistent, std::uint32_t{0}, std::uint16_t{0}, sql);
                 fallback->m_text_mode = true;
                 co_return fallback;
             }
-            throw db::Error(error.code, error.state, error.message);
+            throw db::Error(error.m_code, error.m_state, error.m_message);
         }
         PrepareOk prepared;
         if (!parse_prepare_ok(first, prepared)) {
             throw db::Error("malformed COM_STMT_PREPARE_OK", 2027);
         }
 
-        for (std::uint16_t i = 0; i < prepared.parameters; ++i) {
+        for (std::uint16_t i = 0; i < prepared.m_parameters; ++i) {
             (void)co_await m_channel.read_packet(scratch);
         }
-        if (prepared.parameters > 0) {
+        if (prepared.m_parameters > 0) {
             const auto eof = co_await m_channel.read_packet(scratch);
             EofPacket ignored{};
             if (!parse_eof(eof, ignored)) {
                 throw db::Error("missing EOF after prepared parameters", 2027);
             }
         }
-        for (std::uint16_t i = 0; i < prepared.columns; ++i) {
+        for (std::uint16_t i = 0; i < prepared.m_columns; ++i) {
             (void)co_await m_channel.read_packet(scratch);
         }
-        if (prepared.columns > 0) {
+        if (prepared.m_columns > 0) {
             const auto eof = co_await m_channel.read_packet(scratch);
             EofPacket ignored{};
             if (!parse_eof(eof, ignored)) {
@@ -773,8 +774,8 @@ public:
         }
 
         auto* statement = mem::construct<MysqlStatement>(*m_persistent, *this, *m_persistent,
-                                                         prepared.statement_id,
-                                                         prepared.parameters, sql);
+                                                         prepared.m_statement_id,
+                                                         prepared.m_parameters, sql);
         co_return statement;
     }
 
@@ -810,7 +811,7 @@ public:
     }
 
     void destroy(mem::MemoryResource& resource) noexcept override {
-        this->~MysqlConnection();
+        std::destroy_at(this);
         resource.deallocate(this, sizeof(*this), alignof(MysqlConnection));
     }
 
@@ -823,16 +824,16 @@ public:
         if (header == 0x00) {
             OkPacket ok;
             if (!parse_ok(first, ok)) throw db::Error("malformed OK packet", 2027);
-            result.has_rows = false;
-            result.affected_rows = ok.affected_rows;
-            result.last_insert_id = ok.last_insert_id;
-            result.status = ok.status;
-            result.warnings = ok.warnings;
-            while ((result.status & SERVER_MORE_RESULTS_EXISTS) != 0) {
+            result.m_has_rows = false;
+            result.m_affected_rows = ok.m_affected_rows;
+            result.m_last_insert_id = ok.m_last_insert_id;
+            result.m_status = ok.m_status;
+            result.m_warnings = ok.m_warnings;
+            while ((result.m_status & SERVER_MORE_RESULTS_EXISTS) != 0) {
                 const auto next = co_await m_channel.read_packet(resource);
                 auto extra = co_await read_result(resource, next, binary);
-                result.warnings += extra.warnings;
-                result.status = extra.status;
+                result.m_warnings += extra.m_warnings;
+                result.m_status = extra.m_status;
             }
             co_return result;
         }
@@ -842,14 +843,14 @@ public:
         if (!count_reader.lenenc(column_count) || column_count > kMaxColumns) {
             throw db::Error("invalid MySQL column count", 2027);
         }
-        result.columns.reserve(static_cast<std::size_t>(column_count));
+        result.m_columns.reserve(static_cast<std::size_t>(column_count));
         for (std::uint64_t i = 0; i < column_count; ++i) {
             const auto packet = co_await m_channel.read_packet(resource);
             db::Column column;
             if (!parse_column(packet, column)) {
                 throw db::Error("malformed MySQL column definition", 2027);
             }
-            result.columns.push_back(column);
+            result.m_columns.push_back(column);
         }
 
         const auto terminator = co_await m_channel.read_packet(resource);
@@ -860,12 +861,12 @@ public:
             if (!parse_ok(terminator, ok)) {
                 throw db::Error("missing metadata terminator", 2027);
             }
-            eof.status = ok.status;
-            eof.warnings = ok.warnings;
+            eof.m_status = ok.m_status;
+            eof.m_warnings = ok.m_warnings;
         }
-        result.status = eof.status;
-        result.warnings = eof.warnings;
-        result.has_rows = true;
+        result.m_status = eof.m_status;
+        result.m_warnings = eof.m_warnings;
+        result.m_has_rows = true;
 
         for (;;) {
             const auto packet = co_await m_channel.read_packet(resource);
@@ -878,27 +879,27 @@ public:
                 if (!parse_eof(packet, row_eof)) {
                     throw db::Error("malformed EOF packet", 2027);
                 }
-                result.status = row_eof.status;
-                result.warnings = row_eof.warnings;
+                result.m_status = row_eof.m_status;
+                result.m_warnings = row_eof.m_warnings;
                 break;
             }
             db::Row row(resource);
             const bool parsed = binary
-                                    ? parse_binary_row(packet, result.columns, resource, row)
+                                    ? parse_binary_row(packet, result.m_columns, resource, row)
                                     : parse_text_row(packet,
                                                      static_cast<std::size_t>(column_count),
                                                      resource, row);
             if (!parsed) throw db::Error("malformed MySQL row", 2027);
-            result.rows.push_back(std::move(row));
+            result.m_rows.push_back(std::move(row));
         }
 
-        if ((result.status & SERVER_MORE_RESULTS_EXISTS) != 0) {
+        if ((result.m_status & SERVER_MORE_RESULTS_EXISTS) != 0) {
             for (;;) {
                 const auto next = co_await m_channel.read_packet(resource);
                 auto extra = co_await read_result(resource, next, binary);
-                result.warnings += extra.warnings;
-                result.status = extra.status;
-                if ((extra.status & SERVER_MORE_RESULTS_EXISTS) == 0) break;
+                result.m_warnings += extra.m_warnings;
+                result.m_status = extra.m_status;
+                if ((extra.m_status & SERVER_MORE_RESULTS_EXISTS) == 0) break;
             }
         }
         co_return result;
@@ -915,7 +916,7 @@ private:
         if (!parse_error(packet, error)) {
             throw db::Error("malformed MySQL error packet", 2027);
         }
-        throw db::Error(error.code, error.state, error.message);
+        throw db::Error(error.m_code, error.m_state, error.m_message);
     }
 
     void throw_network(const char* operation, int code, int error) {
@@ -940,16 +941,16 @@ private:
         m_handshake = handshake;
 
         char plugin[64]{};
-        std::memcpy(plugin, handshake.auth_plugin, sizeof(plugin) - 1);
+        std::memcpy(plugin, handshake.m_auth_plugin, sizeof(plugin) - 1);
         std::array<std::uint8_t, 20> scramble{};
-        std::memcpy(scramble.data(), handshake.scramble.data(),
-                    std::min(handshake.scramble_length, scramble.size()));
-        std::size_t scramble_length = std::min<std::size_t>(handshake.scramble_length, 20);
+        std::memcpy(scramble.data(), handshake.m_scramble.data(),
+                    std::min(handshake.m_scramble_length, scramble.size()));
+        std::size_t scramble_length = std::min<std::size_t>(handshake.m_scramble_length, 20);
 
         bool tls = false;
-        if (m_options.tls_mode != db::TlsMode::Disabled) {
-            if ((handshake.capabilities & CLIENT_SSL) == 0) {
-                if (m_options.tls_mode == db::TlsMode::Required) {
+        if (m_options.m_tls_mode != db::TlsMode::Disabled) {
+            if ((handshake.m_capabilities & CLIENT_SSL) == 0) {
+                if (m_options.m_tls_mode == db::TlsMode::Required) {
                     throw db::Error("MySQL server does not support TLS", 2026);
                 }
             } else {
@@ -962,7 +963,7 @@ private:
         }
         auto build_response = [&](bool use_tls) {
             Bytes auth = auth_response_for(
-                plugin, m_options.password,
+                plugin, m_options.m_password,
                 std::span<const std::uint8_t>(scramble.data(), scramble_length),
                 *m_persistent);
             return build_handshake_response(handshake, m_options, auth, plugin,
@@ -1005,10 +1006,10 @@ private:
                         throw db::Error("mysql_clear_password requires TLS", 2026);
                     }
                     Bytes clear = make_bytes(*m_persistent);
-                    clear.resize(m_options.password.size() + 1);
-                    std::memcpy(clear.data(), m_options.password.data(),
-                                m_options.password.size());
-                    clear[m_options.password.size()] = std::byte{0};
+                    clear.resize(m_options.m_password.size() + 1);
+                    std::memcpy(clear.data(), m_options.m_password.data(),
+                                m_options.m_password.size());
+                    clear[m_options.m_password.size()] = std::byte{0};
                     co_await m_channel.write_packet(clear);
                     continue;
                 }
@@ -1030,10 +1031,10 @@ private:
                     sha256) {
                     if (m_channel.tls_active()) {
                         Bytes clear = make_bytes(*m_persistent);
-                        clear.resize(m_options.password.size() + 1);
-                        std::memcpy(clear.data(), m_options.password.data(),
-                                    m_options.password.size());
-                        clear[m_options.password.size()] = std::byte{0};
+                        clear.resize(m_options.m_password.size() + 1);
+                        std::memcpy(clear.data(), m_options.m_password.data(),
+                                    m_options.m_password.size());
+                        clear[m_options.m_password.size()] = std::byte{0};
                         co_await m_channel.write_packet(clear);
                         continue;
                     }
@@ -1052,7 +1053,7 @@ private:
                         pem = key_packet.subspan(1);
                     }
                     Bytes encrypted = rsa_encrypt_password(
-                        m_options.password,
+                        m_options.m_password,
                         std::span<const std::uint8_t>(scramble.data(), scramble_length),
                         {reinterpret_cast<const char*>(pem.data()), pem.size()},
                         *m_persistent);
@@ -1062,7 +1063,7 @@ private:
                 if (caching && !data.empty() &&
                     std::to_integer<std::uint8_t>(data[0]) == '-') {
                     Bytes encrypted = rsa_encrypt_password(
-                        m_options.password,
+                        m_options.m_password,
                         std::span<const std::uint8_t>(scramble.data(), scramble_length),
                         {reinterpret_cast<const char*>(data.data()), data.size()},
                         *m_persistent);
@@ -1127,7 +1128,7 @@ Task<db::ResultSet> MysqlStatement::execute_impl(
         if (!parse_error(first, error)) {
             throw db::Error("malformed MySQL error packet", 2027);
         }
-        throw db::Error(error.code, error.state, error.message);
+        throw db::Error(error.m_code, error.m_state, error.m_message);
     }
     db::ResultSet result =
         co_await m_connection->read_result(result_resource, first, true);
@@ -1184,7 +1185,7 @@ public:
     }
 
     void destroy(mem::MemoryResource& resource) noexcept override {
-        this->~MysqlDriver();
+        std::destroy_at(this);
         resource.deallocate(this, sizeof(*this), alignof(MysqlDriver));
     }
 

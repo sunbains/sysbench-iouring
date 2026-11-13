@@ -41,14 +41,14 @@ std::string_view strip_dashes(std::string_view value) {
 OptionDef::OptionDef(mem::MemoryResource& resource, std::string_view name_value,
                      std::string_view description_value, OptionType type_value,
                      std::string_view default_value, bool custom_value)
-    : name(mem::Allocator<char>(&resource)),
-      description(mem::Allocator<char>(&resource)),
-      value(mem::Allocator<char>(&resource)),
-      type(type_value),
-      custom(custom_value) {
-    name.assign(name_value);
-    description.assign(description_value);
-    value.assign(default_value);
+    : m_name(mem::Allocator<char>(&resource)),
+      m_description(mem::Allocator<char>(&resource)),
+      m_value(mem::Allocator<char>(&resource)),
+      m_type(type_value),
+      m_custom(custom_value) {
+    m_name.assign(name_value);
+    m_description.assign(description_value);
+    m_value.assign(default_value);
 }
 
 Options::Options(mem::MemoryResource& resource) : m_resource(&resource) {
@@ -132,7 +132,7 @@ bool Options::add(std::string_view name, std::string_view description,
 OptionDef* Options::find(std::string_view name) noexcept {
     name = strip_dashes(name);
     for (std::size_t i = 0; i < m_count; ++i) {
-        if (m_entries[i]->name == name) return m_entries[i];
+        if (m_entries[i]->m_name == name) return m_entries[i];
     }
     char normalized[192]{};
     if (name.size() < sizeof(normalized)) {
@@ -141,13 +141,13 @@ OptionDef* Options::find(std::string_view name) noexcept {
         }
         const std::string_view alternate(normalized, name.size());
         for (std::size_t i = 0; i < m_count; ++i) {
-            if (m_entries[i]->name == alternate) return m_entries[i];
+            if (m_entries[i]->m_name == alternate) return m_entries[i];
         }
         for (std::size_t i = 0; i < name.size(); ++i) {
             normalized[i] = name[i] == '_' ? '-' : name[i];
         }
         for (std::size_t i = 0; i < m_count; ++i) {
-            if (m_entries[i]->name == std::string_view(normalized, name.size())) {
+            if (m_entries[i]->m_name == std::string_view(normalized, name.size())) {
                 return m_entries[i];
             }
         }
@@ -158,7 +158,7 @@ OptionDef* Options::find(std::string_view name) noexcept {
 const OptionDef* Options::find(std::string_view name) const noexcept {
     name = strip_dashes(name);
     for (std::size_t i = 0; i < m_count; ++i) {
-        if (m_entries[i]->name == name) return m_entries[i];
+        if (m_entries[i]->m_name == name) return m_entries[i];
     }
     char normalized[192]{};
     if (name.size() < sizeof(normalized)) {
@@ -167,7 +167,7 @@ const OptionDef* Options::find(std::string_view name) const noexcept {
         }
         const std::string_view alternate(normalized, name.size());
         for (std::size_t i = 0; i < m_count; ++i) {
-            if (m_entries[i]->name == alternate) return m_entries[i];
+            if (m_entries[i]->m_name == alternate) return m_entries[i];
         }
     }
     return nullptr;
@@ -254,57 +254,57 @@ bool Options::set(std::string_view name, std::string_view value,
         return false;
     }
 
-    switch (option->type) {
+    switch (option->m_type) {
         case OptionType::Bool: {
             bool parsed = false;
             if (!value.empty() && !parse_bool_value(value, parsed)) {
                 error = make_error(*m_resource, "invalid boolean value for --");
-                error.append(option->name);
+                error.append(option->m_name);
                 return false;
             }
             if (value.empty()) parsed = true;
-            option->value.assign(parsed ? "on" : "off");
+            option->m_value.assign(parsed ? "on" : "off");
             return true;
         }
         case OptionType::Int: {
             std::int64_t parsed = 0;
             if (!parse_int_value(value, parsed)) {
                 error = make_error(*m_resource, "invalid integer value for --");
-                error.append(option->name);
+                error.append(option->m_name);
                 return false;
             }
             char buffer[32]{};
             const auto result = std::to_chars(buffer, buffer + sizeof(buffer), parsed);
-            option->value.assign(buffer, result.ptr);
+            option->m_value.assign(buffer, result.ptr);
             return true;
         }
         case OptionType::Size: {
             std::uint64_t parsed = 0;
             if (!parse_size_value(value, parsed)) {
                 error = make_error(*m_resource, "invalid size value for --");
-                error.append(option->name);
+                error.append(option->m_name);
                 return false;
             }
             char buffer[32]{};
             const auto result = std::to_chars(buffer, buffer + sizeof(buffer), parsed);
-            option->value.assign(buffer, result.ptr);
+            option->m_value.assign(buffer, result.ptr);
             return true;
         }
         case OptionType::Double: {
             double parsed = 0.0;
             if (!parse_double_value(value, parsed)) {
                 error = make_error(*m_resource, "invalid number for --");
-                error.append(option->name);
+                error.append(option->m_name);
                 return false;
             }
             char buffer[64]{};
             const auto result = std::to_chars(buffer, buffer + sizeof(buffer), parsed);
-            option->value.assign(buffer, result.ptr);
+            option->m_value.assign(buffer, result.ptr);
             return true;
         }
         case OptionType::String:
         case OptionType::List:
-            option->value.assign(value);
+            option->m_value.assign(value);
             return true;
     }
     return false;
@@ -314,14 +314,14 @@ bool Options::as_bool(std::string_view name, bool fallback) const {
     const OptionDef* option = find(name);
     if (option == nullptr) return fallback;
     bool result = fallback;
-    return parse_bool_value(option->value, result) ? result : fallback;
+    return parse_bool_value(option->m_value, result) ? result : fallback;
 }
 
 std::int64_t Options::as_int(std::string_view name, std::int64_t fallback) const {
     const OptionDef* option = find(name);
     if (option == nullptr) return fallback;
     std::int64_t result = fallback;
-    return parse_int_value(option->value, result) ? result : fallback;
+    return parse_int_value(option->m_value, result) ? result : fallback;
 }
 
 std::uint64_t Options::as_size(std::string_view name,
@@ -329,20 +329,20 @@ std::uint64_t Options::as_size(std::string_view name,
     const OptionDef* option = find(name);
     if (option == nullptr) return fallback;
     std::uint64_t result = fallback;
-    return parse_size_value(option->value, result) ? result : fallback;
+    return parse_size_value(option->m_value, result) ? result : fallback;
 }
 
 double Options::as_double(std::string_view name, double fallback) const {
     const OptionDef* option = find(name);
     if (option == nullptr) return fallback;
     double result = fallback;
-    return parse_double_value(option->value, result) ? result : fallback;
+    return parse_double_value(option->m_value, result) ? result : fallback;
 }
 
 std::string_view Options::as_string(std::string_view name,
                                     std::string_view fallback) const {
     const OptionDef* option = find(name);
-    return option != nullptr ? std::string_view(option->value) : fallback;
+    return option != nullptr ? std::string_view(option->m_value) : fallback;
 }
 
 bool Options::looks_like_script(std::string_view token) const {
@@ -413,11 +413,11 @@ bool Options::scan_arguments(int argc, char** argv, ParsedArgs& parsed,
             continue;
         }
         if (!after_separator && (token == "--help" || token == "-h")) {
-            parsed.help = true;
+            parsed.m_help = true;
             continue;
         }
         if (!after_separator && (token == "--version" || token == "-V")) {
-            parsed.version = true;
+            parsed.m_version = true;
             continue;
         }
         if (!after_separator && token.starts_with("--")) {
@@ -427,7 +427,7 @@ bool Options::scan_arguments(int argc, char** argv, ParsedArgs& parsed,
                                                  : token.substr(2, equals - 2);
             const OptionDef* option = find(name);
             if (equals == std::string_view::npos && option != nullptr &&
-                option->type != OptionType::Bool && i + 1 < argc) {
+                option->m_type != OptionType::Bool && i + 1 < argc) {
                 ++i;
             }
             continue;
@@ -443,8 +443,8 @@ bool Options::scan_arguments(int argc, char** argv, ParsedArgs& parsed,
     }
 
     if (candidate_count == 0) {
-        if (parsed.help || parsed.version) {
-            parsed.valid = true;
+        if (parsed.m_help || parsed.m_version) {
+            parsed.m_valid = true;
             return true;
         }
         error = make_error(*m_resource, "no benchmark script specified");
@@ -460,10 +460,10 @@ bool Options::scan_arguments(int argc, char** argv, ParsedArgs& parsed,
     }
     if (script_candidate < 0) script_candidate = 0;
 
-    parsed.script_arg.assign(candidates[script_candidate]);
-    parsed.script_index = candidate_indices[script_candidate];
-    parsed.script_path = resolve_script(parsed.script_arg, error);
-    if (parsed.script_path.empty()) return false;
+    parsed.m_script_arg.assign(candidates[script_candidate]);
+    parsed.m_script_index = candidate_indices[script_candidate];
+    parsed.m_script_path = resolve_script(parsed.m_script_arg, error);
+    if (parsed.m_script_path.empty()) return false;
 
     int command_candidate = -1;
     for (int i = script_candidate + 1; i < candidate_count; ++i) {
@@ -473,21 +473,21 @@ bool Options::scan_arguments(int argc, char** argv, ParsedArgs& parsed,
         command_candidate = script_candidate + 1;
     }
     if (command_candidate >= 0) {
-        parsed.command.assign(candidates[command_candidate]);
-        parsed.command_index = candidate_indices[command_candidate];
+        parsed.m_command.assign(candidates[command_candidate]);
+        parsed.m_command_index = candidate_indices[command_candidate];
     }
-    if (parsed.command.empty() && !parsed.help && !parsed.version) {
+    if (parsed.m_command.empty() && !parsed.m_help && !parsed.m_version) {
         error = make_error(*m_resource, "no command specified (run, prepare, cleanup, help)");
         return false;
     }
-    parsed.valid = true;
+    parsed.m_valid = true;
     return true;
 }
 
 bool Options::apply_arguments(int argc, char** argv, const ParsedArgs& parsed,
                               mem::String& error) {
     for (int i = 1; i < argc; ++i) {
-        if (i == parsed.script_index || i == parsed.command_index) continue;
+        if (i == parsed.m_script_index || i == parsed.m_command_index) continue;
         const std::string_view token(argv[i]);
         if (token == "--" || token == "--help" || token == "-h" ||
             token == "--version" || token == "-V") {
@@ -500,7 +500,7 @@ bool Options::apply_arguments(int argc, char** argv, const ParsedArgs& parsed,
                 error.push_back('\'');
                 return false;
             }
-            if (i > 0 && i - 1 != parsed.script_index && i - 1 != parsed.command_index) {
+            if (i > 0 && i - 1 != parsed.m_script_index && i - 1 != parsed.m_command_index) {
                 // Extra positional tokens are accepted only when they were
                 // consumed as values by an earlier option.
             }
@@ -524,7 +524,7 @@ bool Options::apply_arguments(int argc, char** argv, const ParsedArgs& parsed,
             error.push_back('\'');
             return false;
         }
-        if (option->type == OptionType::Bool) {
+        if (option->m_type == OptionType::Bool) {
             if (i + 1 < argc) {
                 bool parsed_bool = false;
                 if (parse_bool_value(argv[i + 1], parsed_bool)) {

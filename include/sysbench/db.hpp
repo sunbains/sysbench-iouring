@@ -33,38 +33,38 @@
 namespace sb::db {
 
 struct Field {
-    const char* data = nullptr;
-    std::uint32_t length = 0;
-    bool is_null = true;
+    const char* m_data = nullptr;
+    std::uint32_t m_length = 0;
+    bool m_is_null = true;
 };
 
 struct Column {
-    std::string_view name;
-    std::uint8_t type = 0;
-    std::uint16_t flags = 0;
-    std::uint32_t charset = 0;
+    std::string_view m_name;
+    std::uint8_t m_type = 0;
+    std::uint16_t m_flags = 0;
+    std::uint32_t m_charset = 0;
 };
 
 struct Row {
-    mem::Vector<Field> fields;
+    mem::Vector<Field> m_fields;
     explicit Row(mem::MemoryResource& resource)
-        : fields(mem::Allocator<Field>(&resource)) {}
+        : m_fields(mem::Allocator<Field>(&resource)) {}
 };
 
 struct ResultSet {
-    mem::Vector<Column> columns;
-    mem::Vector<Row> rows;
-    std::uint64_t affected_rows = 0;
-    std::uint64_t last_insert_id = 0;
-    std::uint16_t warnings = 0;
-    std::uint16_t status = 0;
-    bool has_rows = false;
-    bool more_results = false;
-    std::uint64_t bytes_read = 0;
+    mem::Vector<Column> m_columns;
+    mem::Vector<Row> m_rows;
+    std::uint64_t m_affected_rows = 0;
+    std::uint64_t m_last_insert_id = 0;
+    std::uint16_t m_warnings = 0;
+    std::uint16_t m_status = 0;
+    bool m_has_rows = false;
+    bool m_more_results = false;
+    std::uint64_t m_bytes_read = 0;
 
     explicit ResultSet(mem::MemoryResource& resource)
-        : columns(mem::Allocator<Column>(&resource)),
-          rows(mem::Allocator<Row>(&resource)) {}
+        : m_columns(mem::Allocator<Column>(&resource)),
+          m_rows(mem::Allocator<Row>(&resource)) {}
     ResultSet(ResultSet&&) noexcept = default;
     ResultSet& operator=(ResultSet&&) noexcept = default;
     ResultSet(const ResultSet&) = delete;
@@ -74,28 +74,28 @@ struct ResultSet {
 enum class BindKind : std::uint8_t { Null, Integer, Real, Bytes };
 
 struct BindValue {
-    BindKind kind = BindKind::Null;
-    std::int64_t integer = 0;
-    double real = 0.0;
-    std::string_view bytes;
+    BindKind m_kind = BindKind::Null;
+    std::int64_t m_integer = 0;
+    double m_real = 0.0;
+    std::string_view m_bytes;
 
     static BindValue null() noexcept { return {}; }
     static BindValue from_int(std::int64_t value) noexcept {
         BindValue result;
-        result.kind = BindKind::Integer;
-        result.integer = value;
+        result.m_kind = BindKind::Integer;
+        result.m_integer = value;
         return result;
     }
     static BindValue from_double(double value) noexcept {
         BindValue result;
-        result.kind = BindKind::Real;
-        result.real = value;
+        result.m_kind = BindKind::Real;
+        result.m_real = value;
         return result;
     }
     static BindValue from_bytes(std::string_view value) noexcept {
         BindValue result;
-        result.kind = BindKind::Bytes;
-        result.bytes = value;
+        result.m_kind = BindKind::Bytes;
+        result.m_bytes = value;
         return result;
     }
 };
@@ -125,19 +125,19 @@ private:
 enum class TlsMode : std::uint8_t { Disabled, Preferred, Required };
 
 struct ConnectionOptions {
-    std::string_view host = "127.0.0.1";
-    std::string_view port = "3306";
-    std::string_view user = "root";
-    std::string_view password;
-    std::string_view database;
-    std::string_view socket_path;
-    std::uint32_t connect_timeout_ms = 5000;
-    std::uint32_t max_packet_size = 16 * 1024 * 1024;
-    TlsMode tls_mode = TlsMode::Disabled;
-    bool tls_verify_server_cert = false;
-    std::string_view tls_ca;
-    std::string_view tls_cert;
-    std::string_view tls_key;
+    std::string_view m_host = "127.0.0.1";
+    std::string_view m_port = "3306";
+    std::string_view m_user = "root";
+    std::string_view m_password;
+    std::string_view m_database;
+    std::string_view m_socket_path;
+    std::uint32_t m_connect_timeout_ms = 5000;
+    std::uint32_t m_max_packet_size = 16 * 1024 * 1024;
+    TlsMode m_tls_mode = TlsMode::Disabled;
+    bool m_tls_verify_server_cert = false;
+    std::string_view m_tls_ca;
+    std::string_view m_tls_cert;
+    std::string_view m_tls_key;
 };
 
 class Connection;
@@ -203,8 +203,8 @@ public:
 
 private:
     struct Entry {
-        std::string_view name;
-        Driver::CreateFn create = nullptr;
+        std::string_view m_name;
+        Driver::CreateFn m_create = nullptr;
     };
     Entry m_entries[kMaxDrivers]{};
     std::size_t m_count = 0;

@@ -31,17 +31,17 @@ namespace sb {
 void request_lua_stop() noexcept;
 
 struct LuaRunOptions {
-    db::ConnectionOptions database;
-    std::uint32_t threads = 1;
-    std::uint32_t workers = 0;
-    std::uint64_t time_seconds = 10;
-    std::uint64_t events = 0;
-    std::uint64_t warmup_seconds = 0;
-    std::uint64_t rate = 0;
-    std::uint32_t report_interval = 1;
-    std::uint32_t percentile = 95;
-    bool histogram = false;
-    std::uint64_t seed = 0;
+    db::ConnectionOptions m_database;
+    std::uint32_t m_threads = 1;
+    std::uint32_t m_workers = 0;
+    std::uint64_t m_time_seconds = 10;
+    std::uint64_t m_events = 0;
+    std::uint64_t m_warmup_seconds = 0;
+    std::uint64_t m_rate = 0;
+    std::uint32_t m_report_interval = 1;
+    std::uint32_t m_percentile = 95;
+    bool m_histogram = false;
+    std::uint64_t m_seed = 0;
 };
 
 // Owns the script's bootstrap Lua state and runs benchmark/command states on

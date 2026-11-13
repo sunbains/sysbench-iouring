@@ -62,11 +62,11 @@ public:
     static constexpr std::uint32_t kMaxWorkers = 64;
 
     struct Config {
-        std::uint32_t workers = 1;
-        std::size_t worker_heap_bytes = 32 * 1024 * 1024;
-        bool pin_workers = true;
-        bool numa_aware = true;
-        std::uint32_t first_cpu = 0;
+        std::uint32_t m_workers = 1;
+        std::size_t m_worker_heap_bytes = 32 * 1024 * 1024;
+        bool m_pin_workers = true;
+        bool m_numa_aware = true;
+        std::uint32_t m_first_cpu = 0;
     };
 
     Runtime() = default;
@@ -152,10 +152,10 @@ public:
     // and joined by the Runtime; callers only supply a body and an optional
     // stop hook used during shutdown.
     struct ThreadSpec {
-        const void* key = nullptr;
-        void* (*body)(void*) = nullptr;
-        void (*stop)(void*) = nullptr;
-        void* argument = nullptr;
+        const void* m_key = nullptr;
+        void* (*m_body)(void*) = nullptr;
+        void (*m_stop)(void*) = nullptr;
+        void* m_argument = nullptr;
     };
     [[nodiscard]] bool start_thread(const ThreadSpec& spec);
     void join_thread(const void* key);
@@ -184,11 +184,11 @@ private:
     std::atomic<bool> m_stop_requested{false};
     static constexpr std::uint32_t kMaxThreads = 256;
     struct ThreadSlot {
-        std::atomic<std::uintptr_t> key{0};
-        void* (*body)(void*) = nullptr;
-        void (*stop)(void*) = nullptr;
-        void* argument = nullptr;
-        std::thread thread;
+        std::atomic<std::uintptr_t> m_key{0};
+        void* (*m_body)(void*) = nullptr;
+        void (*m_stop)(void*) = nullptr;
+        void* m_argument = nullptr;
+        std::thread m_thread;
     };
     ThreadSlot m_thread_slots[kMaxThreads];
 

@@ -83,7 +83,7 @@ io_uring_sqe* IoRing::acquire_sqe(IoCompletion* completion) noexcept {
         sqe = io_uring_get_sqe(&m_ring);
     }
     if (sqe == nullptr) {
-        completion->result = -ENOBUFS;
+        completion->m_result = -ENOBUFS;
         m_last_error = ENOBUFS;
         return nullptr;
     }
@@ -95,7 +95,7 @@ io_uring_sqe* IoRing::acquire_sqe(IoCompletion* completion) noexcept {
 bool IoRing::submit_read_fixed(int fd, void* buffer, unsigned length, int slot,
                                IoCompletion* completion) noexcept {
     if (slot < 0 || static_cast<unsigned>(slot) >= m_registered_buffers) {
-        completion->result = -EINVAL;
+        completion->m_result = -EINVAL;
         return false;
     }
     io_uring_sqe* sqe = acquire_sqe(completion);
@@ -108,7 +108,7 @@ bool IoRing::submit_read_fixed(int fd, void* buffer, unsigned length, int slot,
 bool IoRing::submit_write_fixed(int fd, const void* buffer, unsigned length,
                                 int slot, IoCompletion* completion) noexcept {
     if (slot < 0 || static_cast<unsigned>(slot) >= m_registered_buffers) {
-        completion->result = -EINVAL;
+        completion->m_result = -EINVAL;
         return false;
     }
     io_uring_sqe* sqe = acquire_sqe(completion);
@@ -211,8 +211,8 @@ RegisteredBufferPool::RegisteredBufferPool(IoRing& ring, mem::MemoryResource& me
 
     for (unsigned i = 0; i < m_slot_count; ++i) {
         auto* data = static_cast<std::byte*>(m_base) + (stride * i);
-        m_slots[i].data = data;
-        m_slots[i].in_use = false;
+        m_slots[i].m_data = data;
+        m_slots[i].m_in_use = false;
         m_iovecs[i].iov_base = data;
         m_iovecs[i].iov_len = m_slot_size;
         m_free_stack[i] = i;
@@ -229,13 +229,13 @@ RegisteredBufferPool::~RegisteredBufferPool() {
 RegisteredBufferLease RegisteredBufferPool::acquire() {
     if (m_free_count == 0) return {};
     const unsigned slot = m_free_stack[--m_free_count];
-    m_slots[slot].in_use = true;
+    m_slots[slot].m_in_use = true;
     return RegisteredBufferLease(this, slot);
 }
 
 void RegisteredBufferPool::release(unsigned slot) noexcept {
-    if (slot >= m_slot_count || !m_slots[slot].in_use) return;
-    m_slots[slot].in_use = false;
+    if (slot >= m_slot_count || !m_slots[slot].m_in_use) return;
+    m_slots[slot].m_in_use = false;
     m_free_stack[m_free_count++] = slot;
 }
 

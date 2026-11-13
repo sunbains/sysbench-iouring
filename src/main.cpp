@@ -57,18 +57,18 @@ void print_builtin_help(sb::Options& options) {
         if (option == nullptr) continue;
         char display[192]{};
         const std::size_t length =
-            std::min(option->name.size(), sizeof(display) - 1);
+            std::min(option->m_name.size(), sizeof(display) - 1);
         for (std::size_t j = 0; j < length; ++j) {
-            display[j] = option->name[j] == '_' ? '-' : option->name[j];
+            display[j] = option->m_name[j] == '_' ? '-' : option->m_name[j];
         }
         std::println("  --{:<28} {} (default: {})", display,
-                    option->description.c_str(), option->value.c_str());
+                    option->m_description.c_str(), option->m_value.c_str());
     }
 }
 
 struct MemoryDefaults {
-    std::uint64_t bytes = 4ull * 1024 * 1024 * 1024;
-    bool populate = false;
+    std::uint64_t m_bytes = 4ull * 1024 * 1024 * 1024;
+    bool m_populate = false;
 };
 
 MemoryDefaults prescan_memory(int argc, char** argv) {
@@ -76,22 +76,22 @@ MemoryDefaults prescan_memory(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         const std::string_view argument(argv[i]);
         if (argument == "--populate-memory") {
-            result.populate = true;
+            result.m_populate = true;
         } else if (argument.starts_with("--memory-size=")) {
             std::uint64_t parsed = 0;
             if (sb::Options::parse_size_value(argument.substr(14), parsed) &&
                 parsed > 0) {
-                result.bytes = parsed;
+                result.m_bytes = parsed;
             }
         } else if (argument == "--memory-size" && i + 1 < argc) {
             std::uint64_t parsed = 0;
             if (sb::Options::parse_size_value(argv[i + 1], parsed) && parsed > 0) {
-                result.bytes = parsed;
+                result.m_bytes = parsed;
             }
             ++i;
         }
     }
-    if (result.bytes < 64ull * 1024 * 1024) result.bytes = 64ull * 1024 * 1024;
+    if (result.m_bytes < 64ull * 1024 * 1024) result.m_bytes = 64ull * 1024 * 1024;
     return result;
 }
 
@@ -116,10 +116,10 @@ int main(int argc, char** argv) {
 
     const MemoryDefaults memory = prescan_memory(argc, argv);
     try {
-        sb::mem::GlobalAllocator::instance().initialize(memory.bytes, memory.populate);
+        sb::mem::GlobalAllocator::instance().initialize(memory.m_bytes, memory.m_populate);
     } catch (const std::exception& error) {
         std::println(stderr, "sysbench: cannot reserve {} bytes: {}",
-                     static_cast<unsigned long long>(memory.bytes), error.what());
+                     static_cast<unsigned long long>(memory.m_bytes), error.what());
         return EXIT_FAILURE;
     }
 
@@ -138,7 +138,7 @@ int main(int argc, char** argv) {
     const std::uint64_t main_heap_bytes =
         std::min<std::uint64_t>(256ull * 1024 * 1024,
                                 std::max<std::uint64_t>(16ull * 1024 * 1024,
-                                                        memory.bytes / 16));
+                                                        memory.m_bytes / 16));
     sb::mem::HeapArena main_heap(root, static_cast<std::size_t>(main_heap_bytes),
                                  "main", home_node);
     sb::Options options(main_heap);
@@ -150,11 +150,11 @@ int main(int argc, char** argv) {
         print_builtin_help(options);
         return EXIT_FAILURE;
     }
-    if (parsed.version) {
+    if (parsed.m_version) {
         print_version();
         return EXIT_SUCCESS;
     }
-    if (parsed.help && parsed.script_path.empty()) {
+    if (parsed.m_help && parsed.m_script_path.empty()) {
         print_builtin_help(options);
         return EXIT_SUCCESS;
     }
@@ -162,8 +162,8 @@ int main(int argc, char** argv) {
     sb::mysql::register_driver();
 
     auto engine = sb::mem::construct<sb::LuaEngine>(
-        main_heap, main_heap, options, std::string_view(parsed.script_path),
-        std::string_view(parsed.command), argc, argv);
+        main_heap, main_heap, options, std::string_view(parsed.m_script_path),
+        std::string_view(parsed.m_command), argc, argv);
     if (!engine->load(error)) {
         print_error(error);
         sb::mem::destroy(main_heap, engine);
@@ -174,7 +174,7 @@ int main(int argc, char** argv) {
         sb::mem::destroy(main_heap, engine);
         return EXIT_FAILURE;
     }
-    if (parsed.help) {
+    if (parsed.m_help) {
         engine->print_help();
         sb::mem::destroy(main_heap, engine);
         return EXIT_SUCCESS;
@@ -196,7 +196,7 @@ int main(int argc, char** argv) {
         static_cast<std::uint64_t>(std::max<std::int64_t>(0, options.as_int("time", 10)));
     const std::uint64_t events =
         static_cast<std::uint64_t>(std::max<std::int64_t>(0, options.as_int("events", 0)));
-    if (parsed.command == "run" && time_seconds == 0 && events == 0) {
+    if (parsed.m_command == "run" && time_seconds == 0 && events == 0) {
         std::println(stderr, "sysbench: either --time or --events must be non-zero");
         sb::mem::destroy(main_heap, engine);
         return EXIT_FAILURE;
@@ -237,54 +237,54 @@ int main(int argc, char** argv) {
     const auto password = options.as_string("mysql-password", "");
     const auto database_name = options.as_string("mysql-db", "");
     const auto socket_path = options.as_string("mysql-socket", "");
-    database.host = host;
-    database.port = port;
-    database.user = user;
-    database.password = password;
-    database.database = database_name;
-    database.socket_path = socket_path;
-    database.connect_timeout_ms = 5000;
+    database.m_host = host;
+    database.m_port = port;
+    database.m_user = user;
+    database.m_password = password;
+    database.m_database = database_name;
+    database.m_socket_path = socket_path;
+    database.m_connect_timeout_ms = 5000;
     const auto ssl_mode = options.as_string("mysql-ssl", "off");
     if (ssl_mode == "on" || ssl_mode == "required") {
-        database.tls_mode = sb::db::TlsMode::Required;
+        database.m_tls_mode = sb::db::TlsMode::Required;
     } else if (ssl_mode == "preferred") {
-        database.tls_mode = sb::db::TlsMode::Preferred;
+        database.m_tls_mode = sb::db::TlsMode::Preferred;
     } else if (ssl_mode == "off" || ssl_mode == "disabled") {
-        database.tls_mode = sb::db::TlsMode::Disabled;
+        database.m_tls_mode = sb::db::TlsMode::Disabled;
     } else {
         std::println(stderr, "sysbench: --mysql-ssl must be off, preferred, or required");
         sb::mem::destroy(main_heap, engine);
         return EXIT_FAILURE;
     }
-    database.tls_verify_server_cert =
+    database.m_tls_verify_server_cert =
         options.as_bool("mysql-ssl-verify-server-cert", false);
-    database.tls_ca = options.as_string("mysql-ssl-ca", "");
-    database.tls_cert = options.as_string("mysql-ssl-cert", "");
-    database.tls_key = options.as_string("mysql-ssl-key", "");
+    database.m_tls_ca = options.as_string("mysql-ssl-ca", "");
+    database.m_tls_cert = options.as_string("mysql-ssl-cert", "");
+    database.m_tls_key = options.as_string("mysql-ssl-key", "");
 
     sb::LuaRunOptions run_options;
-    run_options.database = database;
-    run_options.threads = threads;
-    run_options.workers = workers;
-    run_options.time_seconds = time_seconds;
-    run_options.events = events;
-    run_options.warmup_seconds =
+    run_options.m_database = database;
+    run_options.m_threads = threads;
+    run_options.m_workers = workers;
+    run_options.m_time_seconds = time_seconds;
+    run_options.m_events = events;
+    run_options.m_warmup_seconds =
         static_cast<std::uint64_t>(std::max<std::int64_t>(0, options.as_int("warmup-time", 0)));
-    run_options.rate =
+    run_options.m_rate =
         static_cast<std::uint64_t>(std::max<std::int64_t>(0, options.as_int("rate", 0)));
-    run_options.report_interval = static_cast<std::uint32_t>(
+    run_options.m_report_interval = static_cast<std::uint32_t>(
         std::max<std::int64_t>(0, options.as_int("report-interval", 1)));
-    run_options.percentile = static_cast<std::uint32_t>(
+    run_options.m_percentile = static_cast<std::uint32_t>(
         std::clamp<std::int64_t>(options.as_int("percentile", 95), 0, 100));
-    run_options.histogram = options.as_bool("histogram", false);
+    run_options.m_histogram = options.as_bool("histogram", false);
     const std::int64_t seed = options.as_int("seed", 0) != 0
                                   ? options.as_int("seed", 0)
                                   : options.as_int("rand-seed", 0);
-    run_options.seed = static_cast<std::uint64_t>(std::max<std::int64_t>(0, seed));
+    run_options.m_seed = static_cast<std::uint64_t>(std::max<std::int64_t>(0, seed));
     const bool numa_enabled = options.as_bool("numa", true);
     const bool pin_workers = options.as_bool("pin-workers", true);
 
-    if (parsed.command == "help") {
+    if (parsed.m_command == "help") {
         const int result = engine->call_help();
         sb::mem::destroy(main_heap, engine);
         return result;
@@ -293,11 +293,11 @@ int main(int argc, char** argv) {
     sb::Runtime runtime;
     try {
         runtime.start(sb::Runtime::Config{
-            .workers = workers,
-            .worker_heap_bytes = static_cast<std::size_t>(worker_heap_bytes),
-            .pin_workers = pin_workers,
-            .numa_aware = numa_enabled,
-            .first_cpu = 0});
+            .m_workers = workers,
+            .m_worker_heap_bytes = static_cast<std::size_t>(worker_heap_bytes),
+            .m_pin_workers = pin_workers,
+            .m_numa_aware = numa_enabled,
+            .m_first_cpu = 0});
     } catch (const std::exception& failure) {
         std::println(stderr, "sysbench: cannot start runtime: {}", failure.what());
         sb::mem::destroy(main_heap, engine);
@@ -305,19 +305,19 @@ int main(int argc, char** argv) {
     }
 
     int result = EXIT_SUCCESS;
-    if (parsed.command == "run") {
+    if (parsed.m_command == "run") {
         std::println("sysbench {}: running {} with {} thread(s) on {} worker(s), "
                      "{} NUMA node(s){}",
-                     SYSBENCH_VERSION, parsed.script_arg.c_str(), threads, workers,
+                     SYSBENCH_VERSION, parsed.m_script_arg.c_str(), threads, workers,
                      numa_topology.node_count(),
                      numa_enabled && numa_topology.available() ? " (node-local)" : "");
         result = engine->run(runtime, run_options);
     } else {
-        const bool parallel = engine->command_parallel(parsed.command);
+        const bool parallel = engine->command_parallel(parsed.m_command);
         std::println("sysbench {}: executing '{}' with {} thread(s)",
-                    SYSBENCH_VERSION, parsed.command.c_str(),
+                    SYSBENCH_VERSION, parsed.m_command.c_str(),
                     parallel ? threads : 1u);
-        result = engine->run_command(runtime, run_options, parsed.command, parallel);
+        result = engine->run_command(runtime, run_options, parsed.m_command, parallel);
     }
 
     runtime.shutdown();

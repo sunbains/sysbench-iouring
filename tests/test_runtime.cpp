@@ -86,7 +86,7 @@ Task<void> allocate_on_worker(std::atomic<int>& allocations,
 
 TEST("runtime executes and joins top-level tasks") {
     Runtime runtime;
-    runtime.start(Runtime::Config{.workers = 2, .worker_heap_bytes = 2 * 1024 * 1024});
+    runtime.start(Runtime::Config{.m_workers = 2, .m_worker_heap_bytes = 2 * 1024 * 1024});
     std::atomic<std::uint64_t> count{0};
     for (int i = 0; i < 4000; ++i) {
         runtime.spawn(yielding_counter(count, 4));
@@ -99,7 +99,7 @@ TEST("runtime executes and joins top-level tasks") {
 
 TEST("task values and exceptions propagate") {
     Runtime runtime;
-    runtime.start(Runtime::Config{.workers = 1, .worker_heap_bytes = 2 * 1024 * 1024});
+    runtime.start(Runtime::Config{.m_workers = 1, .m_worker_heap_bytes = 2 * 1024 * 1024});
     std::atomic<int> value{0};
     std::atomic<bool> caught{false};
     runtime.spawn(parent_of_child(value));
@@ -112,7 +112,7 @@ TEST("task values and exceptions propagate") {
 
 TEST("sleepers are scheduled by worker timers") {
     Runtime runtime;
-    runtime.start(Runtime::Config{.workers = 4, .worker_heap_bytes = 2 * 1024 * 1024});
+    runtime.start(Runtime::Config{.m_workers = 4, .m_worker_heap_bytes = 2 * 1024 * 1024});
     const auto start = std::chrono::steady_clock::now();
     std::atomic<int> done{0};
     std::atomic<std::int64_t> elapsed_sum{0};
@@ -130,7 +130,7 @@ TEST("sleepers are scheduled by worker timers") {
 
 TEST("worker allocators are hierarchical and worker-affine") {
     Runtime runtime;
-    runtime.start(Runtime::Config{.workers = 4, .worker_heap_bytes = 2 * 1024 * 1024});
+    runtime.start(Runtime::Config{.m_workers = 4, .m_worker_heap_bytes = 2 * 1024 * 1024});
     std::atomic<int> allocations{0};
     std::atomic<std::uint32_t> seen{0};
     for (int i = 0; i < 100; ++i) {
@@ -141,8 +141,8 @@ TEST("worker allocators are hierarchical and worker-affine") {
     CHECK(seen.load() != 0);
     for (std::uint32_t worker = 0; worker < 4; ++worker) {
         const auto stats = runtime.worker_heap_stats(worker);
-        CHECK(stats.allocations > 0);
-        CHECK(stats.used < stats.capacity);
+        CHECK(stats.m_allocations > 0);
+        CHECK(stats.m_used < stats.m_capacity);
     }
     runtime.shutdown();
 }
@@ -150,7 +150,7 @@ TEST("worker allocators are hierarchical and worker-affine") {
 TEST("runtime task spawn throughput") {
     if (!::sb::test::perf_enabled()) return;
     Runtime runtime;
-    runtime.start(Runtime::Config{.workers = 4, .worker_heap_bytes = 4 * 1024 * 1024});
+    runtime.start(Runtime::Config{.m_workers = 4, .m_worker_heap_bytes = 4 * 1024 * 1024});
     constexpr int kTasks = 50'000;
     std::atomic<std::uint64_t> count{0};
     const double ops = ::sb::test::measure_ops_per_second(kTasks, [&] {
@@ -168,7 +168,7 @@ TEST("runtime task spawn throughput") {
 TEST("runtime yield throughput") {
     if (!::sb::test::perf_enabled()) return;
     Runtime runtime;
-    runtime.start(Runtime::Config{.workers = 1, .worker_heap_bytes = 2 * 1024 * 1024});
+    runtime.start(Runtime::Config{.m_workers = 1, .m_worker_heap_bytes = 2 * 1024 * 1024});
     constexpr std::uint64_t kYields = 1'000'000;
     std::atomic<std::uint64_t> count{0};
     auto task = yielding_counter(count, static_cast<int>(kYields));

@@ -62,10 +62,10 @@ TEST("sharded counters are indexed by thread ID") {
     // Every increment runs as a Runtime task; the test owns no threads and
     // every scheduling decision belongs to the Runtime.
     Runtime runtime;
-    runtime.start(Runtime::Config{.workers = kThreads,
-                                  .worker_heap_bytes = 1024 * 1024,
-                                  .pin_workers = false,
-                                  .numa_aware = false});
+    runtime.start(Runtime::Config{.m_workers = kThreads,
+                                  .m_worker_heap_bytes = 1024 * 1024,
+                                  .m_pin_workers = false,
+                                  .m_numa_aware = false});
     for (std::uint32_t id = 0; id < kThreads; ++id) {
         runtime.spawn(increment_shard(counter, id));
     }
@@ -112,17 +112,17 @@ TEST("thread stats aggregate counters and latency") {
     thread.record_reconnect();
     std::vector<ThreadStats*> threads{&thread};
     const StatsSnapshot snapshot = aggregate(threads, 95);
-    CHECK_EQ(snapshot.events, 10u);
-    CHECK_EQ(snapshot.reads, 4u);
-    CHECK_EQ(snapshot.writes, 3u);
-    CHECK_EQ(snapshot.other, 3u);
-    CHECK_EQ(snapshot.errors, 1u);
-    CHECK_EQ(snapshot.reconnects, 1u);
-    CHECK_EQ(snapshot.threads_running, 1u);
-    CHECK(snapshot.latency_avg > 0.0);
-    CHECK(snapshot.latency_p95 >= snapshot.latency_p50);
-    CHECK(snapshot.thread_events_max == 10u);
-    CHECK(snapshot.histogram.total == 10u);
+    CHECK_EQ(snapshot.m_events, 10u);
+    CHECK_EQ(snapshot.m_reads, 4u);
+    CHECK_EQ(snapshot.m_writes, 3u);
+    CHECK_EQ(snapshot.m_other, 3u);
+    CHECK_EQ(snapshot.m_errors, 1u);
+    CHECK_EQ(snapshot.m_reconnects, 1u);
+    CHECK_EQ(snapshot.m_threads_running, 1u);
+    CHECK(snapshot.m_latency_avg > 0.0);
+    CHECK(snapshot.m_latency_p95 >= snapshot.m_latency_p50);
+    CHECK(snapshot.m_thread_events_max == 10u);
+    CHECK(snapshot.m_histogram.m_total == 10u);
 }
 
 TEST("aggregate spans multiple threads") {
@@ -134,13 +134,13 @@ TEST("aggregate spans multiple threads") {
     for (int i = 0; i < 5; ++i) b.record_event_latency(5000, false);
     ThreadStats* threads[] = {&a, &b};
     const StatsSnapshot result = aggregate(threads, 99);
-    CHECK_EQ(result.events, 10u);
-    CHECK_EQ(result.reads, 1u);
-    CHECK_EQ(result.writes, 1u);
-    CHECK_EQ(result.histogram.total, 10u);
-    CHECK_EQ(result.thread_events_min, 5u);
-    CHECK_EQ(result.thread_events_max, 5u);
-    CHECK(result.thread_events_avg == 5.0);
+    CHECK_EQ(result.m_events, 10u);
+    CHECK_EQ(result.m_reads, 1u);
+    CHECK_EQ(result.m_writes, 1u);
+    CHECK_EQ(result.m_histogram.m_total, 10u);
+    CHECK_EQ(result.m_thread_events_min, 5u);
+    CHECK_EQ(result.m_thread_events_max, 5u);
+    CHECK(result.m_thread_events_avg == 5.0);
 }
 
 TEST("interval difference") {
@@ -151,9 +151,9 @@ TEST("interval difference") {
     for (int i = 0; i < 50; ++i) thread.record_event_latency(4000, false);
     const auto second = aggregate(threads, 95);
     const auto delta = second.difference(first, 95);
-    CHECK_EQ(delta.events, 50u);
-    CHECK(delta.latency_p50 >= 0.000003);
-    CHECK(delta.latency_p95 >= 0.000003);
+    CHECK_EQ(delta.m_events, 50u);
+    CHECK(delta.m_latency_p50 >= 0.000003);
+    CHECK(delta.m_latency_p95 >= 0.000003);
 }
 
 TEST("timestamped event recording") {

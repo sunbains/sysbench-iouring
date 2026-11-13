@@ -131,12 +131,12 @@ Topology::Topology() {
             if (count == 0) continue;
 
             NodeInfo& node = m_nodes[m_node_count++];
-            node.id = id;
-            node.cpu_count = count;
-            order_cpus_by_core(raw, count, node.cpus.data());
+            node.m_id = id;
+            node.m_cpu_count = count;
+            order_cpus_by_core(raw, count, node.m_cpus.data());
             for (std::uint32_t cpu = 0; cpu < count; ++cpu) {
-                if (node.cpus[cpu] < kMaxCpuCount) {
-                    m_cpu_to_node[node.cpus[cpu]] = id;
+                if (node.m_cpus[cpu] < kMaxCpuCount) {
+                    m_cpu_to_node[node.m_cpus[cpu]] = id;
                 }
             }
         }
@@ -145,23 +145,23 @@ Topology::Topology() {
     if (m_node_count == 0) {
         // Fallback: one synthetic node covering the process affinity mask.
         NodeInfo& node = m_nodes[m_node_count++];
-        node.id = 0;
+        node.m_id = 0;
         cpu_set_t set;
         CPU_ZERO(&set);
         if (::sched_getaffinity(0, sizeof(set), &set) == 0) {
             for (unsigned cpu = 0; cpu < kMaxCpuCount && cpu < CPU_SETSIZE; ++cpu) {
-                if (CPU_ISSET(cpu, &set) && node.cpu_count < kMaxNodeCpus) {
+                if (CPU_ISSET(cpu, &set) && node.m_cpu_count < kMaxNodeCpus) {
                     m_cpu_to_node[cpu] = 0;
-                    node.cpus[node.cpu_count++] = cpu;
+                    node.m_cpus[node.m_cpu_count++] = cpu;
                 }
             }
         }
-        if (node.cpu_count == 0) {
+        if (node.m_cpu_count == 0) {
             const long online = ::sysconf(_SC_NPROCESSORS_ONLN);
             const std::uint32_t count =
                 static_cast<std::uint32_t>(std::clamp<long>(online, 1, kMaxNodeCpus));
             for (std::uint32_t cpu = 0; cpu < count; ++cpu) {
-                node.cpus[node.cpu_count++] = cpu;
+                node.m_cpus[node.m_cpu_count++] = cpu;
                 m_cpu_to_node[cpu] = 0;
             }
         }
@@ -169,12 +169,12 @@ Topology::Topology() {
 
     const int current = ::sched_getcpu();
     m_home_node = current >= 0 ? node_of_cpu(static_cast<unsigned>(current)) : -1;
-    if (m_home_node < 0) m_home_node = m_nodes[0].id;
+    if (m_home_node < 0) m_home_node = m_nodes[0].m_id;
     m_reserved_cpu = -1;
     for (std::uint32_t index = 0; index < m_node_count; ++index) {
-        if (m_nodes[index].id == m_home_node && m_nodes[index].cpu_count > 0) {
+        if (m_nodes[index].m_id == m_home_node && m_nodes[index].m_cpu_count > 0) {
             m_reserved_cpu = static_cast<int>(
-                m_nodes[index].cpus[m_nodes[index].cpu_count - 1]);
+                m_nodes[index].m_cpus[m_nodes[index].m_cpu_count - 1]);
             break;
         }
     }
@@ -187,7 +187,7 @@ const NodeInfo& Topology::node(std::uint32_t index) const noexcept {
 
 const NodeInfo* Topology::node_by_id(int id) const noexcept {
     for (std::uint32_t index = 0; index < m_node_count; ++index) {
-        if (m_nodes[index].id == id) return &m_nodes[index];
+        if (m_nodes[index].m_id == id) return &m_nodes[index];
     }
     return nullptr;
 }
@@ -199,22 +199,22 @@ int Topology::node_of_cpu(unsigned cpu) const noexcept {
 
 int Topology::node_for_worker(std::uint32_t worker) const noexcept {
     if (m_node_count == 0) return -1;
-    return m_nodes[worker % m_node_count].id;
+    return m_nodes[worker % m_node_count].m_id;
 }
 
 int Topology::cpu_for_worker(std::uint32_t worker) const noexcept {
     if (m_node_count == 0) return -1;
     const std::uint32_t node_index = worker % m_node_count;
     const NodeInfo& info = m_nodes[node_index];
-    if (info.cpu_count == 0) return -1;
+    if (info.m_cpu_count == 0) return -1;
     const std::uint32_t ordinal = worker / m_node_count;
-    std::uint32_t slot = ordinal % info.cpu_count;
-    for (std::uint32_t attempts = 0; attempts < info.cpu_count; ++attempts) {
-        const int cpu = static_cast<int>(info.cpus[slot]);
+    std::uint32_t slot = ordinal % info.m_cpu_count;
+    for (std::uint32_t attempts = 0; attempts < info.m_cpu_count; ++attempts) {
+        const int cpu = static_cast<int>(info.m_cpus[slot]);
         if (cpu != m_reserved_cpu) return cpu;
-        slot = (slot + 1) % info.cpu_count;
+        slot = (slot + 1) % info.m_cpu_count;
     }
-    return static_cast<int>(info.cpus[0]);
+    return static_cast<int>(info.m_cpus[0]);
 }
 
 bool bind_range(void* address, std::size_t length, int node) noexcept {

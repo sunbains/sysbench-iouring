@@ -35,8 +35,8 @@ TEST("root reserves up front and honors alignment") {
     CHECK(root.owns(b));
     CHECK(!root.owns(static_cast<void*>(&root)));
     const auto stats = root.stats();
-    CHECK_EQ(stats.allocations, 2u);
-    CHECK(stats.used >= 4096u);
+    CHECK_EQ(stats.m_allocations, 2u);
+    CHECK(stats.m_used >= 4096u);
     CHECK(root.base() != nullptr);
 }
 
@@ -44,7 +44,7 @@ TEST("root exhaustion is deterministic") {
     RootArena root(64 * 1024);
     (void)root.allocate(48 * 1024);
     CHECK_THROWS(root.allocate(64 * 1024));
-    CHECK_EQ(root.stats().failed, 1u);
+    CHECK_EQ(root.stats().m_failed, 1u);
 }
 
 TEST("heap allocate/free/coalesce loop returns to empty") {
@@ -63,15 +63,15 @@ TEST("heap allocate/free/coalesce loop returns to empty") {
         for (int i = 1; i < 256; i += 2) heap.deallocate(blocks[i], 0, 0);
     }
     const auto stats = heap.stats();
-    CHECK_EQ(stats.used, 0u);
-    CHECK(stats.allocations > 10000u);
-    CHECK(stats.frees > 10000u);
+    CHECK_EQ(stats.m_used, 0u);
+    CHECK(stats.m_allocations > 10000u);
+    CHECK(stats.m_frees > 10000u);
 }
 
 TEST("heap handles random lifetimes and reuse") {
     RootArena root(8 * 1024 * 1024);
     HeapArena heap(root, 2 * 1024 * 1024);
-    struct Slot { void* ptr; std::size_t size; };
+    struct Slot { void* m_ptr; std::size_t m_size; };
     Slot slots[512]{};
     std::uint64_t state = 0x9e3779b97f4a7c15ULL;
     auto next = [&] {
@@ -82,23 +82,23 @@ TEST("heap handles random lifetimes and reuse") {
     };
     for (int i = 0; i < 200000; ++i) {
         const std::size_t slot = next() % 512;
-        if (slots[slot].ptr != nullptr) {
-            heap.deallocate(slots[slot].ptr, slots[slot].size, 16);
+        if (slots[slot].m_ptr != nullptr) {
+            heap.deallocate(slots[slot].m_ptr, slots[slot].m_size, 16);
             slots[slot] = {};
         }
         const std::size_t size = (next() % 4096) + 1;
-        slots[slot].ptr = heap.allocate(size, 16);
-        slots[slot].size = size;
-        auto* bytes = static_cast<unsigned char*>(slots[slot].ptr);
+        slots[slot].m_ptr = heap.allocate(size, 16);
+        slots[slot].m_size = size;
+        auto* bytes = static_cast<unsigned char*>(slots[slot].m_ptr);
         bytes[0] = 0x5a;
         bytes[size - 1] = 0xa5;
         CHECK(bytes[0] == (size == 1 ? 0xa5 : 0x5a));
         CHECK(bytes[size - 1] == 0xa5);
     }
     for (auto& slot : slots) {
-        if (slot.ptr != nullptr) heap.deallocate(slot.ptr, slot.size, 16);
+        if (slot.m_ptr != nullptr) heap.deallocate(slot.m_ptr, slot.m_size, 16);
     }
-    CHECK_EQ(heap.stats().used, 0u);
+    CHECK_EQ(heap.stats().m_used, 0u);
 }
 
 TEST("heap supports over-aligned objects and rejects absurd alignment") {
@@ -108,7 +108,7 @@ TEST("heap supports over-aligned objects and rejects absurd alignment") {
     CHECK_EQ(reinterpret_cast<std::uintptr_t>(memory) % 64, 0u);
     std::memset(memory, 0x5a, 64);
     heap.deallocate(memory, 64, 64);
-    CHECK_EQ(heap.stats().used, 0u);
+    CHECK_EQ(heap.stats().m_used, 0u);
     CHECK_THROWS(heap.allocate(64, 8192));
 }
 
@@ -116,13 +116,13 @@ TEST("bump arena supports scopes, nesting, and block release") {
     RootArena root(4 * 1024 * 1024);
     HeapArena heap(root, 2 * 1024 * 1024);
     BumpArena arena(heap, 16 * 1024);
-    const auto initial_used = heap.stats().used;
+    const auto initial_used = heap.stats().m_used;
 
     {
         ScopedAllocator outer(arena);
         auto* a = static_cast<int*>(outer.allocate(sizeof(int) * 100, 16));
         a[0] = 42;
-        const auto after_outer = heap.stats().used;
+        const auto after_outer = heap.stats().m_used;
         CHECK_EQ(after_outer, initial_used);
 
         {
@@ -130,21 +130,21 @@ TEST("bump arena supports scopes, nesting, and block release") {
             auto* buffer = static_cast<char*>(inner.allocate(70 * 1024, 64));
             CHECK_EQ(reinterpret_cast<std::uintptr_t>(buffer) % 64, 0u);
             std::memset(buffer, 1, 70 * 1024);
-            CHECK(arena.stats().capacity >= 70u * 1024u);
-            CHECK(heap.stats().used > after_outer);
+            CHECK(arena.stats().m_capacity >= 70u * 1024u);
+            CHECK(heap.stats().m_used > after_outer);
         }
-        CHECK(heap.stats().used == after_outer);
+        CHECK(heap.stats().m_used == after_outer);
         CHECK_EQ(a[0], 42);
     }
-    CHECK_EQ(heap.stats().used, initial_used);
-    CHECK_EQ(arena.stats().used, 0u);
+    CHECK_EQ(heap.stats().m_used, initial_used);
+    CHECK_EQ(arena.stats().m_used, 0u);
 }
 
 TEST("many nested event scopes stay O(1)") {
     RootArena root(4 * 1024 * 1024);
     HeapArena heap(root, 2 * 1024 * 1024);
     BumpArena arena(heap, 32 * 1024);
-    const auto baseline = heap.stats().used;
+    const auto baseline = heap.stats().m_used;
     for (int event = 0; event < 100000; ++event) {
         ScopedAllocator scope(arena);
         auto* p = static_cast<std::uint64_t*>(scope.allocate(256, 8));
@@ -156,8 +156,8 @@ TEST("many nested event scopes stay O(1)") {
         }
         CHECK_EQ(p[0], static_cast<std::uint64_t>(event));
     }
-    CHECK_EQ(arena.stats().used, 0u);
-    CHECK_EQ(heap.stats().used, baseline);
+    CHECK_EQ(arena.stats().m_used, 0u);
+    CHECK_EQ(heap.stats().m_used, baseline);
 }
 
 TEST("std allocator aliases use the scoped resource") {
@@ -176,7 +176,7 @@ TEST("std allocator aliases use the scoped resource") {
         CHECK(scope.owns(values.data()));
         CHECK(scope.owns(text.data()));
     }
-    CHECK_EQ(arena.stats().used, 0u);
+    CHECK_EQ(arena.stats().m_used, 0u);
 }
 
 TEST("global hierarchical allocator") {

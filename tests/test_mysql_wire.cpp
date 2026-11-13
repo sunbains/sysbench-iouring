@@ -111,8 +111,8 @@ TEST("packet headers round trip and bounds-check") {
     CHECK_EQ(buffer.size(), 9u);
     PacketHeader header;
     CHECK(parse_packet_header(buffer, header));
-    CHECK_EQ(header.length, 5u);
-    CHECK_EQ(header.sequence, 7u);
+    CHECK_EQ(header.m_length, 5u);
+    CHECK_EQ(header.m_sequence, 7u);
     std::array<std::byte, 3> short_buffer{};
     CHECK(!parse_packet_header(short_buffer, header));
 }
@@ -138,21 +138,21 @@ TEST("handshake v10 parsing") {
     Bytes payload = fixture_handshake(root);
     Handshake handshake;
     CHECK(parse_handshake(payload, handshake));
-    CHECK_EQ(std::string_view(handshake.server_version), "8.0.36-test");
-    CHECK_EQ(handshake.connection_id, 42u);
-    CHECK_EQ(handshake.charset, 255);
-    CHECK_EQ(handshake.scramble_length, 20u);
-    CHECK_EQ(std::string_view(reinterpret_cast<const char*>(handshake.scramble.data()), 20),
+    CHECK_EQ(std::string_view(handshake.m_server_version), "8.0.36-test");
+    CHECK_EQ(handshake.m_connection_id, 42u);
+    CHECK_EQ(handshake.m_charset, 255);
+    CHECK_EQ(handshake.m_scramble_length, 20u);
+    CHECK_EQ(std::string_view(reinterpret_cast<const char*>(handshake.m_scramble.data()), 20),
              "abcdefghijklmnopqrst");
-    CHECK_EQ(std::string_view(handshake.auth_plugin), "caching_sha2_password");
-    CHECK((handshake.capabilities & CLIENT_PROTOCOL_41) != 0);
-    CHECK((handshake.capabilities & CLIENT_PLUGIN_AUTH) != 0);
+    CHECK_EQ(std::string_view(handshake.m_auth_plugin), "caching_sha2_password");
+    CHECK((handshake.m_capabilities & CLIENT_PROTOCOL_41) != 0);
+    CHECK((handshake.m_capabilities & CLIENT_PLUGIN_AUTH) != 0);
 
     db::ConnectionOptions options;
-    options.user = "bench";
-    options.database = "test";
+    options.m_user = "bench";
+    options.m_database = "test";
     Bytes auth = auth_response_native("password",
-        std::span<const std::uint8_t>(handshake.scramble.data(), 20), root);
+        std::span<const std::uint8_t>(handshake.m_scramble.data(), 20), root);
     Bytes response = build_handshake_response(handshake, options, auth,
                                              "mysql_native_password", root);
     Reader reader(response);
@@ -199,7 +199,7 @@ TEST("TLS SSLRequest and handshake capability") {
     Handshake handshake;
     CHECK(parse_handshake(payload, handshake));
     db::ConnectionOptions options;
-    options.user = "bench";
+    options.m_user = "bench";
     Bytes request = build_ssl_request(handshake, options, root);
     CHECK_EQ(request.size(), 32u);
     Reader reader(request);
@@ -219,7 +219,7 @@ TEST("TLS SSLRequest and handshake capability") {
     CHECK_EQ(reader.remaining(), 0u);
 
     Bytes auth = auth_response_sha2(
-        "password", std::span<const std::uint8_t>(handshake.scramble.data(), 20),
+        "password", std::span<const std::uint8_t>(handshake.m_scramble.data(), 20),
         root);
     Bytes response = build_handshake_response(
         handshake, options, auth, "caching_sha2_password", root, true);
@@ -240,10 +240,10 @@ TEST("OK, EOF, ERR, prepare-OK and column packets") {
     ok_writer.u16(1);
     OkPacket ok;
     CHECK(parse_ok(ok_bytes, ok));
-    CHECK_EQ(ok.affected_rows, 3u);
-    CHECK_EQ(ok.last_insert_id, 9u);
-    CHECK_EQ(ok.status, 2u);
-    CHECK_EQ(ok.warnings, 1u);
+    CHECK_EQ(ok.m_affected_rows, 3u);
+    CHECK_EQ(ok.m_last_insert_id, 9u);
+    CHECK_EQ(ok.m_status, 2u);
+    CHECK_EQ(ok.m_warnings, 1u);
 
     Bytes eof_bytes = make_bytes(root);
     Writer eof_writer(eof_bytes);
@@ -252,8 +252,8 @@ TEST("OK, EOF, ERR, prepare-OK and column packets") {
     eof_writer.u16(0x0008);
     EofPacket eof;
     CHECK(parse_eof(eof_bytes, eof));
-    CHECK_EQ(eof.warnings, 4u);
-    CHECK_EQ(eof.status, 8u);
+    CHECK_EQ(eof.m_warnings, 4u);
+    CHECK_EQ(eof.m_status, 8u);
 
     Bytes err_bytes = make_bytes(root);
     Writer err_writer(err_bytes);
@@ -263,9 +263,9 @@ TEST("OK, EOF, ERR, prepare-OK and column packets") {
     err_writer.bytes("Duplicate entry");
     ErrorPacket error;
     CHECK(parse_error(err_bytes, error));
-    CHECK_EQ(error.code, 1062u);
-    CHECK_EQ(std::string_view(error.state), "23000");
-    CHECK_EQ(error.message, "Duplicate entry");
+    CHECK_EQ(error.m_code, 1062u);
+    CHECK_EQ(std::string_view(error.m_state), "23000");
+    CHECK_EQ(error.m_message, "Duplicate entry");
 
     Bytes prepare_bytes = make_bytes(root);
     Writer prepare_writer(prepare_bytes);
@@ -277,16 +277,16 @@ TEST("OK, EOF, ERR, prepare-OK and column packets") {
     prepare_writer.u16(0);
     PrepareOk prepare;
     CHECK(parse_prepare_ok(prepare_bytes, prepare));
-    CHECK_EQ(prepare.statement_id, 77u);
-    CHECK_EQ(prepare.columns, 2u);
-    CHECK_EQ(prepare.parameters, 1u);
+    CHECK_EQ(prepare.m_statement_id, 77u);
+    CHECK_EQ(prepare.m_columns, 2u);
+    CHECK_EQ(prepare.m_parameters, 1u);
 
     Bytes column_bytes = fixture_column(root, "c", TYPE_VAR_STRING, 0);
     db::Column column;
     CHECK(parse_column(column_bytes, column));
-    CHECK_EQ(column.name, "c");
-    CHECK_EQ(column.type, TYPE_VAR_STRING);
-    CHECK_EQ(column.charset, 45u);
+    CHECK_EQ(column.m_name, "c");
+    CHECK_EQ(column.m_type, TYPE_VAR_STRING);
+    CHECK_EQ(column.m_charset, 45u);
 }
 
 TEST("text rows preserve NULL and zero-length values") {
@@ -294,24 +294,24 @@ TEST("text rows preserve NULL and zero-length values") {
     Bytes payload = fixture_text_row(root);
     db::Row row(root);
     CHECK(parse_text_row(payload, 3, root, row));
-    CHECK_EQ(row.fields.size(), 3u);
-    CHECK(!row.fields[0].is_null);
-    CHECK_EQ(std::string_view(row.fields[0].data, row.fields[0].length), "abc");
-    CHECK(!row.fields[1].is_null);
-    CHECK_EQ(row.fields[1].length, 0u);
-    CHECK(row.fields[2].is_null);
+    CHECK_EQ(row.m_fields.size(), 3u);
+    CHECK(!row.m_fields[0].m_is_null);
+    CHECK_EQ(std::string_view(row.m_fields[0].m_data, row.m_fields[0].m_length), "abc");
+    CHECK(!row.m_fields[1].m_is_null);
+    CHECK_EQ(row.m_fields[1].m_length, 0u);
+    CHECK(row.m_fields[2].m_is_null);
 }
 
 TEST("binary rows decode numeric and string columns") {
     mem::RootArena root(1024 * 1024);
     db::Column columns[5];
-    columns[0].type = TYPE_TINY;
-    columns[0].flags = 0;
-    columns[1].type = TYPE_LONGLONG;
-    columns[1].flags = UNSIGNED_FLAG;
-    columns[2].type = TYPE_DOUBLE;
-    columns[3].type = TYPE_VAR_STRING;
-    columns[4].type = TYPE_NULL;
+    columns[0].m_type = TYPE_TINY;
+    columns[0].m_flags = 0;
+    columns[1].m_type = TYPE_LONGLONG;
+    columns[1].m_flags = UNSIGNED_FLAG;
+    columns[2].m_type = TYPE_DOUBLE;
+    columns[3].m_type = TYPE_VAR_STRING;
+    columns[4].m_type = TYPE_NULL;
 
     Bytes payload = make_bytes(root);
     Writer writer(payload);
@@ -324,12 +324,12 @@ TEST("binary rows decode numeric and string columns") {
 
     db::Row row(root);
     CHECK(parse_binary_row(payload, columns, root, row));
-    CHECK_EQ(row.fields.size(), 5u);
-    CHECK(row.fields[0].is_null);
-    CHECK_EQ(std::string_view(row.fields[1].data, row.fields[1].length), "42");
-    CHECK_EQ(std::string_view(row.fields[2].data, row.fields[2].length), "3.5");
-    CHECK_EQ(std::string_view(row.fields[3].data, row.fields[3].length), "hello");
-    CHECK(row.fields[4].is_null);
+    CHECK_EQ(row.m_fields.size(), 5u);
+    CHECK(row.m_fields[0].m_is_null);
+    CHECK_EQ(std::string_view(row.m_fields[1].m_data, row.m_fields[1].m_length), "42");
+    CHECK_EQ(std::string_view(row.m_fields[2].m_data, row.m_fields[2].m_length), "3.5");
+    CHECK_EQ(std::string_view(row.m_fields[3].m_data, row.m_fields[3].m_length), "hello");
+    CHECK(row.m_fields[4].m_is_null);
 }
 
 TEST("prepared-statement execute payload") {

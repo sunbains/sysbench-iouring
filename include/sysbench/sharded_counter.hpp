@@ -35,11 +35,11 @@ public:
     static constexpr std::size_t shard_count = ShardCount;
 
     void add(std::uint32_t thread_id, T delta = T{1}) noexcept {
-        shard(thread_id).value.fetch_add(delta, std::memory_order_relaxed);
+        shard(thread_id).m_value.fetch_add(delta, std::memory_order_relaxed);
     }
 
     [[nodiscard]] T get(std::uint32_t thread_id) const noexcept {
-        return shard(thread_id).value.load(std::memory_order_relaxed);
+        return shard(thread_id).m_value.load(std::memory_order_relaxed);
     }
 
     [[nodiscard]] T sum(std::uint32_t active_shards) const noexcept {
@@ -47,20 +47,20 @@ public:
             active_shards < ShardCount ? active_shards : ShardCount;
         T total{};
         for (std::size_t i = 0; i < count; ++i) {
-            total += m_shards[i].value.load(std::memory_order_relaxed);
+            total += m_shards[i].m_value.load(std::memory_order_relaxed);
         }
         return total;
     }
 
     void reset() noexcept {
         for (auto& shard : m_shards) {
-            shard.value.store(T{}, std::memory_order_relaxed);
+            shard.m_value.store(T{}, std::memory_order_relaxed);
         }
     }
 
 private:
     struct alignas(mem::kCacheLine) Shard {
-        std::atomic<T> value{};
+        std::atomic<T> m_value{};
     };
 
     [[nodiscard]] Shard& shard(std::uint32_t thread_id) noexcept {

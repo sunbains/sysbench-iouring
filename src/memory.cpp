@@ -34,8 +34,8 @@ constexpr std::size_t kPageSize = 4096;
 constexpr std::uint64_t kAlignedMagic = 0xA11CED0000000001ull;
 
 struct alignas(16) AlignedHeader {
-    std::uint64_t magic;
-    void* block;
+    std::uint64_t m_magic;
+    void* m_block;
 };
 
 [[nodiscard]] constexpr bool is_power_of_two(std::size_t value) noexcept {
@@ -128,12 +128,12 @@ bool RootArena::owns(const void* ptr) const noexcept {
 
 ResourceStats RootArena::stats() const noexcept {
     ResourceStats result;
-    result.capacity = m_capacity;
-    result.used = m_offset.load(std::memory_order_relaxed);
-    result.peak = m_peak.load(std::memory_order_relaxed);
-    result.allocations = m_allocations.load(std::memory_order_relaxed);
-    result.frees = 0;
-    result.failed = m_failures.load(std::memory_order_relaxed);
+    result.m_capacity = m_capacity;
+    result.m_used = m_offset.load(std::memory_order_relaxed);
+    result.m_peak = m_peak.load(std::memory_order_relaxed);
+    result.m_allocations = m_allocations.load(std::memory_order_relaxed);
+    result.m_frees = 0;
+    result.m_failed = m_failures.load(std::memory_order_relaxed);
     return result;
 }
 
@@ -159,12 +159,12 @@ HeapArena::HeapArena(MemoryResource& parent, std::size_t bytes,
         m_numa_bound = numa::bind_range(m_base, m_capacity, numa_node);
     }
     auto* initial = reinterpret_cast<Block*>(m_base);
-    initial->size = static_cast<std::uint32_t>(m_capacity);
-    initial->prev_size = 0;
-    initial->is_free = 1;
-    initial->bin = bin_for(m_capacity);
-    initial->next_free = nullptr;
-    initial->prev_free = nullptr;
+    initial->m_size = static_cast<std::uint32_t>(m_capacity);
+    initial->m_prev_size = 0;
+    initial->m_is_free = 1;
+    initial->m_bin = bin_for(m_capacity);
+    initial->m_next_free = nullptr;
+    initial->m_prev_free = nullptr;
     insert_free(initial);
 }
 
@@ -194,25 +194,25 @@ void* HeapArena::user_of(Block* block) const noexcept {
 }
 
 void HeapArena::insert_free(Block* block) noexcept {
-    const std::uint32_t bin = bin_for(block->size);
-    block->bin = bin;
-    block->is_free = 1;
-    block->prev_free = nullptr;
-    block->next_free = m_bins[bin];
-    if (m_bins[bin] != nullptr) m_bins[bin]->prev_free = block;
+    const std::uint32_t bin = bin_for(block->m_size);
+    block->m_bin = bin;
+    block->m_is_free = 1;
+    block->m_prev_free = nullptr;
+    block->m_next_free = m_bins[bin];
+    if (m_bins[bin] != nullptr) m_bins[bin]->m_prev_free = block;
     m_bins[bin] = block;
 }
 
 void HeapArena::remove_free(Block* block) noexcept {
-    if (block->prev_free != nullptr) {
-        block->prev_free->next_free = block->next_free;
+    if (block->m_prev_free != nullptr) {
+        block->m_prev_free->m_next_free = block->m_next_free;
     } else {
-        m_bins[block->bin] = block->next_free;
+        m_bins[block->m_bin] = block->m_next_free;
     }
-    if (block->next_free != nullptr) block->next_free->prev_free = block->prev_free;
-    block->next_free = nullptr;
-    block->prev_free = nullptr;
-    block->is_free = 0;
+    if (block->m_next_free != nullptr) block->m_next_free->m_prev_free = block->m_prev_free;
+    block->m_next_free = nullptr;
+    block->m_prev_free = nullptr;
+    block->m_is_free = 0;
 }
 
 HeapArena::Block* HeapArena::find_fit(std::size_t wanted) noexcept {
@@ -220,31 +220,31 @@ HeapArena::Block* HeapArena::find_fit(std::size_t wanted) noexcept {
     for (std::uint32_t bin = first; bin < kBinCount; ++bin) {
         Block* block = m_bins[bin];
         while (block != nullptr) {
-            if (block->size >= wanted) return block;
-            block = block->next_free;
+            if (block->m_size >= wanted) return block;
+            block = block->m_next_free;
         }
     }
     return nullptr;
 }
 
 void HeapArena::split(Block* block, std::size_t wanted) noexcept {
-    if (block->size - wanted < kMinBlock) return;
+    if (block->m_size - wanted < kMinBlock) return;
 
     auto* remainder = reinterpret_cast<Block*>(reinterpret_cast<std::byte*>(block) +
                                                wanted);
-    remainder->size = block->size - static_cast<std::uint32_t>(wanted);
-    remainder->prev_size = static_cast<std::uint32_t>(wanted);
-    remainder->is_free = 0;
-    remainder->bin = 0;
-    remainder->next_free = nullptr;
-    remainder->prev_free = nullptr;
+    remainder->m_size = block->m_size - static_cast<std::uint32_t>(wanted);
+    remainder->m_prev_size = static_cast<std::uint32_t>(wanted);
+    remainder->m_is_free = 0;
+    remainder->m_bin = 0;
+    remainder->m_next_free = nullptr;
+    remainder->m_prev_free = nullptr;
 
-    block->size = static_cast<std::uint32_t>(wanted);
+    block->m_size = static_cast<std::uint32_t>(wanted);
 
-    std::byte* after = reinterpret_cast<std::byte*>(remainder) + remainder->size;
+    std::byte* after = reinterpret_cast<std::byte*>(remainder) + remainder->m_size;
     if (after < m_base + m_capacity) {
         auto* next = reinterpret_cast<Block*>(after);
-        next->prev_size = remainder->size;
+        next->m_prev_size = remainder->m_size;
     }
     insert_free(remainder);
 }
@@ -276,9 +276,9 @@ void* HeapArena::allocate(std::size_t bytes, std::size_t alignment) {
 
     remove_free(block);
     split(block, wanted);
-    block->is_free = 0;
-    block->bin = kUsedBin;
-    m_used += block->size;
+    block->m_is_free = 0;
+    block->m_bin = kUsedBin;
+    m_used += block->m_size;
     m_peak = std::max(m_peak, m_used);
     ++m_allocations;
 
@@ -289,8 +289,8 @@ void* HeapArena::allocate(std::size_t bytes, std::size_t alignment) {
         (reinterpret_cast<std::uintptr_t>(raw) + 32 + alignment - 1) &
         ~(std::uintptr_t(alignment) - 1));
     auto* header = reinterpret_cast<AlignedHeader*>(aligned - sizeof(AlignedHeader));
-    header->magic = kAlignedMagic;
-    header->block = block;
+    header->m_magic = kAlignedMagic;
+    header->m_block = block;
     return reinterpret_cast<void*>(aligned);
 }
 
@@ -300,48 +300,48 @@ void HeapArena::deallocate(void* ptr, std::size_t, std::size_t alignment) noexce
     if (alignment > 16) {
         auto* header = reinterpret_cast<AlignedHeader*>(
             static_cast<std::byte*>(ptr) - sizeof(AlignedHeader));
-        if (header->magic != kAlignedMagic) return;
-        block = static_cast<HeapArena::Block*>(header->block);
-        header->magic = 0;
+        if (header->m_magic != kAlignedMagic) return;
+        block = static_cast<HeapArena::Block*>(header->m_block);
+        header->m_magic = 0;
     } else {
         block = block_of(ptr);
     }
-    if (block == nullptr || block->is_free != 0 || !owns(ptr)) {
+    if (block == nullptr || block->m_is_free != 0 || !owns(ptr)) {
         return;
     }
 
-    m_used -= block->size;
+    m_used -= block->m_size;
     ++m_frees;
-    block->is_free = 1;
+    block->m_is_free = 1;
     coalesce(block);
 }
 
 void HeapArena::coalesce(Block* block) noexcept {
     // Merge with previous block when it is free.
-    if (block->prev_size != 0) {
+    if (block->m_prev_size != 0) {
         auto* previous = reinterpret_cast<Block*>(
-            reinterpret_cast<std::byte*>(block) - block->prev_size);
-        if (previous->is_free != 0) {
+            reinterpret_cast<std::byte*>(block) - block->m_prev_size);
+        if (previous->m_is_free != 0) {
             remove_free(previous);
-            previous->size += block->size;
+            previous->m_size += block->m_size;
             block = previous;
-            std::byte* after = reinterpret_cast<std::byte*>(block) + block->size;
+            std::byte* after = reinterpret_cast<std::byte*>(block) + block->m_size;
             if (after < m_base + m_capacity) {
-                reinterpret_cast<Block*>(after)->prev_size = block->size;
+                reinterpret_cast<Block*>(after)->m_prev_size = block->m_size;
             }
         }
     }
 
     // Merge with the following block when it is free.
-    std::byte* after = reinterpret_cast<std::byte*>(block) + block->size;
+    std::byte* after = reinterpret_cast<std::byte*>(block) + block->m_size;
     if (after < m_base + m_capacity) {
         auto* next = reinterpret_cast<Block*>(after);
-        if (next->is_free != 0) {
+        if (next->m_is_free != 0) {
             remove_free(next);
-            block->size += next->size;
-            std::byte* tail = reinterpret_cast<std::byte*>(block) + block->size;
+            block->m_size += next->m_size;
+            std::byte* tail = reinterpret_cast<std::byte*>(block) + block->m_size;
             if (tail < m_base + m_capacity) {
-                reinterpret_cast<Block*>(tail)->prev_size = block->size;
+                reinterpret_cast<Block*>(tail)->m_prev_size = block->m_size;
             }
         }
     }
@@ -357,23 +357,23 @@ bool HeapArena::owns(const void* ptr) const noexcept {
 
 ResourceStats HeapArena::stats() const noexcept {
     ResourceStats result;
-    result.capacity = m_capacity;
-    result.used = m_used;
-    result.peak = m_peak;
-    result.allocations = m_allocations;
-    result.frees = m_frees;
-    result.failed = m_failures;
+    result.m_capacity = m_capacity;
+    result.m_used = m_used;
+    result.m_peak = m_peak;
+    result.m_allocations = m_allocations;
+    result.m_frees = m_frees;
+    result.m_failed = m_failures;
     return result;
 }
 
 void HeapArena::reset() noexcept {
     std::memset(m_bins, 0, sizeof(m_bins));
     auto* initial = reinterpret_cast<Block*>(m_base);
-    initial->size = saturating_u32(m_capacity);
-    initial->prev_size = 0;
-    initial->is_free = 1;
-    initial->next_free = nullptr;
-    initial->prev_free = nullptr;
+    initial->m_size = saturating_u32(m_capacity);
+    initial->m_prev_size = 0;
+    initial->m_is_free = 1;
+    initial->m_next_free = nullptr;
+    initial->m_prev_free = nullptr;
     insert_free(initial);
     m_used = 0;
     m_allocations = 0;
@@ -397,8 +397,8 @@ BumpArena::BumpArena(MemoryResource& parent, std::size_t block_size,
 BumpArena::~BumpArena() {
     Block* block = m_head;
     while (block != nullptr) {
-        Block* next = block->next;
-        m_parent->deallocate(block, block->capacity + kHeaderAligned, 16);
+        Block* next = block->m_next;
+        m_parent->deallocate(block, block->m_capacity + kHeaderAligned, 16);
         block = next;
     }
     m_head = nullptr;
@@ -411,11 +411,11 @@ BumpArena::Block* BumpArena::new_block(std::size_t payload) {
     const std::size_t total = kHeaderAligned + payload;
     void* memory = m_parent->allocate(total, 16);
     auto* block = static_cast<Block*>(memory);
-    block->next = nullptr;
-    block->capacity = payload;
-    block->used = 0;
+    block->m_next = nullptr;
+    block->m_capacity = payload;
+    block->m_used = 0;
     if (m_current != nullptr) {
-        m_current->next = block;
+        m_current->m_next = block;
     } else {
         m_head = block;
     }
@@ -437,12 +437,12 @@ void* BumpArena::allocate(std::size_t bytes, std::size_t alignment) {
 
     for (;;) {
         const auto base = reinterpret_cast<std::uintptr_t>(payload_of(m_current));
-        const std::uintptr_t current_address = base + m_current->used;
+        const std::uintptr_t current_address = base + m_current->m_used;
         const std::uintptr_t aligned_address =
             (current_address + alignment - 1) & ~(std::uintptr_t(alignment) - 1);
         const std::size_t offset = aligned_address - base;
-        if (offset <= m_current->capacity && bytes <= m_current->capacity - offset) {
-            m_current->used = offset + bytes;
+        if (offset <= m_current->m_capacity && bytes <= m_current->m_capacity - offset) {
+            m_current->m_used = offset + bytes;
             m_used += bytes;
             m_peak = std::max(m_peak, m_used);
             ++m_allocations;
@@ -455,34 +455,34 @@ void* BumpArena::allocate(std::size_t bytes, std::size_t alignment) {
 
 bool BumpArena::owns(const void* ptr) const noexcept {
     const auto address = reinterpret_cast<std::uintptr_t>(ptr);
-    for (Block* block = m_head; block != nullptr; block = block->next) {
+    for (Block* block = m_head; block != nullptr; block = block->m_next) {
         const auto begin = reinterpret_cast<std::uintptr_t>(payload_of(block));
-        if (address >= begin && address < begin + block->capacity) return true;
+        if (address >= begin && address < begin + block->m_capacity) return true;
     }
     return false;
 }
 
 ResourceStats BumpArena::stats() const noexcept {
     ResourceStats result;
-    result.capacity = m_total_capacity;
-    result.used = m_used;
-    result.peak = m_peak;
-    result.allocations = m_allocations;
-    result.frees = 0;
-    result.failed = m_failures;
+    result.m_capacity = m_total_capacity;
+    result.m_used = m_used;
+    result.m_peak = m_peak;
+    result.m_allocations = m_allocations;
+    result.m_frees = 0;
+    result.m_failed = m_failures;
     return result;
 }
 
 BumpArena::Mark BumpArena::mark() const noexcept {
-    return Mark{m_current, m_current != nullptr ? m_current->used : 0, m_generation};
+    return Mark{m_current, m_current != nullptr ? m_current->m_used : 0, m_generation};
 }
 
 void BumpArena::rewind(Mark mark) noexcept {
-    if (mark.block == nullptr) {
+    if (mark.m_block == nullptr) {
         Block* block = m_head;
         while (block != nullptr) {
-            Block* next = block->next;
-            m_parent->deallocate(block, block->capacity + kHeaderAligned, 16);
+            Block* next = block->m_next;
+            m_parent->deallocate(block, block->m_capacity + kHeaderAligned, 16);
             block = next;
         }
         m_head = nullptr;
@@ -492,24 +492,24 @@ void BumpArena::rewind(Mark mark) noexcept {
         return;
     }
 
-    auto* target = static_cast<Block*>(mark.block);
-    if (target->used > mark.used) target->used = mark.used;
+    auto* target = static_cast<Block*>(mark.m_block);
+    if (target->m_used > mark.m_used) target->m_used = mark.m_used;
 
-    Block* block = target->next;
+    Block* block = target->m_next;
     while (block != nullptr) {
-        Block* next = block->next;
-        m_parent->deallocate(block, block->capacity + kHeaderAligned, 16);
-        m_total_capacity -= block->capacity;
+        Block* next = block->m_next;
+        m_parent->deallocate(block, block->m_capacity + kHeaderAligned, 16);
+        m_total_capacity -= block->m_capacity;
         block = next;
     }
-    target->next = nullptr;
+    target->m_next = nullptr;
     m_current = target;
 
     std::size_t used = 0;
     std::size_t capacity = 0;
-    for (Block* it = m_head; it != nullptr; it = it->next) {
-        used += it->used;
-        capacity += it->capacity;
+    for (Block* it = m_head; it != nullptr; it = it->m_next) {
+        used += it->m_used;
+        capacity += it->m_capacity;
     }
     m_used = used;
     m_total_capacity = capacity;
@@ -560,11 +560,11 @@ constexpr std::size_t kFrameSlabSize = 1024 * 1024;
 constexpr std::size_t kFrameReserve = 64;
 
 struct alignas(16) FrameHeader {
-    std::uint32_t class_index;
-    std::uint32_t node;
-    std::uint32_t magic;
-    std::uint32_t reserved;
-    FrameHeader* next;
+    std::uint32_t m_class_index;
+    std::uint32_t m_node;
+    std::uint32_t m_magic;
+    std::uint32_t m_reserved;
+    FrameHeader* m_next;
 };
 
 constexpr std::uint32_t kFrameAlive = 0xA11CF00Du;
@@ -581,7 +581,7 @@ constexpr std::uint64_t kFramePointerMask = (1ull << 48) - 1;
 constexpr unsigned kFrameTagShift = 48;
 
 struct alignas(64) FrameStack {
-    std::atomic<std::uint64_t> head{0};
+    std::atomic<std::uint64_t> m_head{0};
 };
 
 std::array<std::array<FrameStack, kFrameClasses>, numa::kMaxNodes>& frame_stacks() {
@@ -590,9 +590,9 @@ std::array<std::array<FrameStack, kFrameClasses>, numa::kMaxNodes>& frame_stacks
 }
 
 struct FrameSlab {
-    std::byte* base = nullptr;
-    std::size_t capacity = 0;
-    std::size_t used = 0;
+    std::byte* m_base = nullptr;
+    std::size_t m_capacity = 0;
+    std::size_t m_used = 0;
 };
 
 thread_local int tls_frame_node = 0;
@@ -628,15 +628,15 @@ std::size_t frame_capacity(std::size_t index) noexcept {
 }
 
 void push_frame(FrameStack& stack, FrameHeader* header) noexcept {
-    std::uint64_t old = stack.head.load(std::memory_order_acquire);
+    std::uint64_t old = stack.m_head.load(std::memory_order_acquire);
     for (;;) {
         const std::uint64_t tag =
             ((old >> kFrameTagShift) + 1) & 0xffffu;
         const std::uint64_t address =
             reinterpret_cast<std::uintptr_t>(header) & kFramePointerMask;
         const std::uint64_t desired = (tag << kFrameTagShift) | address;
-        header->next = reinterpret_cast<FrameHeader*>(old & kFramePointerMask);
-        if (stack.head.compare_exchange_weak(old, desired,
+        header->m_next = reinterpret_cast<FrameHeader*>(old & kFramePointerMask);
+        if (stack.m_head.compare_exchange_weak(old, desired,
                                              std::memory_order_release,
                                              std::memory_order_acquire)) {
             return;
@@ -645,7 +645,7 @@ void push_frame(FrameStack& stack, FrameHeader* header) noexcept {
 }
 
 FrameHeader* pop_frame(FrameStack& stack) noexcept {
-    std::uint64_t old = stack.head.load(std::memory_order_acquire);
+    std::uint64_t old = stack.m_head.load(std::memory_order_acquire);
     for (;;) {
         auto* header = reinterpret_cast<FrameHeader*>(old & kFramePointerMask);
         if (header == nullptr) return nullptr;
@@ -653,11 +653,11 @@ FrameHeader* pop_frame(FrameStack& stack) noexcept {
             ((old >> kFrameTagShift) + 1) & 0xffffu;
         const std::uint64_t desired =
             (tag << kFrameTagShift) |
-            (reinterpret_cast<std::uintptr_t>(header->next) & kFramePointerMask);
-        if (stack.head.compare_exchange_weak(old, desired,
+            (reinterpret_cast<std::uintptr_t>(header->m_next) & kFramePointerMask);
+        if (stack.m_head.compare_exchange_weak(old, desired,
                                              std::memory_order_acq_rel,
                                              std::memory_order_acquire)) {
-            header->next = nullptr;
+            header->m_next = nullptr;
             return header;
         }
     }
@@ -678,7 +678,7 @@ void set_thread_frame_node(int node) noexcept {
         tls_frame_cache_count[index] = 0;
         FrameStack& stack = frame_stack_for(previous, index);
         while (header != nullptr) {
-            FrameHeader* next = header->next;
+            FrameHeader* next = header->m_next;
             push_frame(stack, header);
             header = next;
         }
@@ -694,10 +694,10 @@ void* allocate_task_frame(std::size_t size) {
 
     if (tls_frame_cache[index] != nullptr) {
         FrameHeader* header = tls_frame_cache[index];
-        tls_frame_cache[index] = header->next;
+        tls_frame_cache[index] = header->m_next;
         --tls_frame_cache_count[index];
-        header->next = nullptr;
-        header->magic = kFrameAlive;
+        header->m_next = nullptr;
+        header->m_magic = kFrameAlive;
         return reinterpret_cast<std::byte*>(header) + kFrameReserve;
     }
 
@@ -705,16 +705,16 @@ void* allocate_task_frame(std::size_t size) {
     for (std::size_t i = 0; i < kFrameCachePerClass; ++i) {
         FrameHeader* header = pop_frame(stack);
         if (header == nullptr) break;
-        header->next = tls_frame_cache[index];
+        header->m_next = tls_frame_cache[index];
         tls_frame_cache[index] = header;
         ++tls_frame_cache_count[index];
     }
     if (tls_frame_cache[index] != nullptr) {
         FrameHeader* header = tls_frame_cache[index];
-        tls_frame_cache[index] = header->next;
+        tls_frame_cache[index] = header->m_next;
         --tls_frame_cache_count[index];
-        header->next = nullptr;
-        header->magic = kFrameAlive;
+        header->m_next = nullptr;
+        header->m_magic = kFrameAlive;
         return reinterpret_cast<std::byte*>(header) + kFrameReserve;
     }
 
@@ -723,24 +723,24 @@ void* allocate_task_frame(std::size_t size) {
             ? static_cast<std::size_t>(node)
             : 0;
     FrameSlab& slab = tls_frame_slabs[safe_node];
-    if (slab.base == nullptr || slab.used + need > slab.capacity) {
+    if (slab.m_base == nullptr || slab.m_used + need > slab.m_capacity) {
         const std::size_t slab_size = align_up(std::max(kFrameSlabSize, need), 4096);
         auto* base = static_cast<std::byte*>(global_root().allocate(slab_size, 4096));
         if (node >= 0 && static_cast<std::uint32_t>(node) < numa::kMaxNodes) {
             (void)numa::bind_range(base, slab_size, node);
         }
-        slab.base = base;
-        slab.capacity = slab_size;
-        slab.used = 0;
+        slab.m_base = base;
+        slab.m_capacity = slab_size;
+        slab.m_used = 0;
     }
 
-    auto* header = reinterpret_cast<FrameHeader*>(slab.base + slab.used);
-    slab.used += need;
-    header->class_index = static_cast<std::uint32_t>(index);
-    header->node = static_cast<std::uint32_t>(safe_node);
-    header->magic = kFrameAlive;
-    header->reserved = 0;
-    header->next = nullptr;
+    auto* header = reinterpret_cast<FrameHeader*>(slab.m_base + slab.m_used);
+    slab.m_used += need;
+    header->m_class_index = static_cast<std::uint32_t>(index);
+    header->m_node = static_cast<std::uint32_t>(safe_node);
+    header->m_magic = kFrameAlive;
+    header->m_reserved = 0;
+    header->m_next = nullptr;
     return reinterpret_cast<std::byte*>(header) + kFrameReserve;
 }
 
@@ -748,22 +748,22 @@ void deallocate_task_frame(void* pointer, std::size_t) noexcept {
     if (pointer == nullptr) return;
     auto* header = reinterpret_cast<FrameHeader*>(
         static_cast<std::byte*>(pointer) - kFrameReserve);
-    if (header->magic != kFrameAlive) {
+    if (header->m_magic != kFrameAlive) {
         std::println(stderr, "sysbench: coroutine frame pool corruption (ptr={:p} magic={:x})",
-                     pointer, header->magic);
+                     pointer, header->m_magic);
         std::abort();
     }
-    header->magic = kFrameFree;
-    const std::size_t index = header->class_index;
+    header->m_magic = kFrameFree;
+    const std::size_t index = header->m_class_index;
     if (index >= kFrameClasses) return;
-    if (static_cast<int>(header->node) == tls_frame_node &&
+    if (static_cast<int>(header->m_node) == tls_frame_node &&
         tls_frame_cache_count[index] < kFrameCachePerClass) {
-        header->next = tls_frame_cache[index];
+        header->m_next = tls_frame_cache[index];
         tls_frame_cache[index] = header;
         ++tls_frame_cache_count[index];
         return;
     }
-    FrameStack& stack = frame_stack_for(static_cast<int>(header->node), index);
+    FrameStack& stack = frame_stack_for(static_cast<int>(header->m_node), index);
     push_frame(stack, header);
 }
 

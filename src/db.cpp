@@ -50,7 +50,7 @@ DriverRegistry& DriverRegistry::instance() {
 bool DriverRegistry::add(std::string_view name, Driver::CreateFn factory) noexcept {
     if (name.empty() || factory == nullptr || m_count >= kMaxDrivers) return false;
     for (std::size_t i = 0; i < m_count; ++i) {
-        if (m_entries[i].name == name) return false;
+        if (m_entries[i].m_name == name) return false;
     }
     m_entries[m_count++] = Entry{name, factory};
     return true;
@@ -59,21 +59,21 @@ bool DriverRegistry::add(std::string_view name, Driver::CreateFn factory) noexce
 Driver* DriverRegistry::create(std::string_view name,
                                mem::MemoryResource& resource) const {
     for (std::size_t i = 0; i < m_count; ++i) {
-        if (m_entries[i].name == name) return m_entries[i].create(resource);
+        if (m_entries[i].m_name == name) return m_entries[i].m_create(resource);
     }
     return nullptr;
 }
 
 bool DriverRegistry::contains(std::string_view name) const noexcept {
     for (std::size_t i = 0; i < m_count; ++i) {
-        if (m_entries[i].name == name) return true;
+        if (m_entries[i].m_name == name) return true;
     }
     return false;
 }
 
 std::string_view DriverRegistry::name_at(std::size_t index) const noexcept {
     if (index >= m_count) return {};
-    return m_entries[index].name;
+    return m_entries[index].m_name;
 }
 
 }  // namespace sb::db

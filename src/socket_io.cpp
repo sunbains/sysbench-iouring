@@ -39,19 +39,19 @@ void pin_to_node(int node) noexcept {
     if (info == nullptr) return;
     cpu_set_t set;
     CPU_ZERO(&set);
-    for (std::uint32_t i = 0; i < info->cpu_count; ++i) {
-        const int cpu = static_cast<int>(info->cpus[i]);
+    for (std::uint32_t i = 0; i < info->m_cpu_count; ++i) {
+        const int cpu = static_cast<int>(info->m_cpus[i]);
         if (cpu != topology.reserved_cpu()) CPU_SET(cpu, &set);
     }
     (void)::pthread_setaffinity_np(::pthread_self(), sizeof(set), &set);
 }
 
 bool enqueue_awaiter(SocketIo& io, IoRequest& request) noexcept {
-    request.completion.task = detail::tls_current;
-    if (request.completion.task == nullptr) detail::no_runtime();
+    request.m_completion.m_task = detail::tls_current;
+    if (request.m_completion.m_task == nullptr) detail::no_runtime();
     if (!io.enqueue(request)) {
-        request.completion.result = -ENOBUFS;
-        detail::schedule_current(request.completion.task);
+        request.m_completion.m_result = -ENOBUFS;
+        detail::schedule_current(request.m_completion.m_task);
         return false;
     }
     return true;
@@ -143,35 +143,35 @@ void SocketIo::submit_pending() noexcept {
     for (std::size_t i = 0; i < count; ++i) {
         IoRequest* item = batch[i];
         bool ok = false;
-        switch (item->operation) {
+        switch (item->m_operation) {
             case IoOperation::ReadFixed:
-                ok = m_ring.submit_read_fixed(item->fd, item->buffer, item->length,
-                                             item->slot, &item->completion);
+                ok = m_ring.submit_read_fixed(item->m_fd, item->m_buffer, item->m_length,
+                                             item->m_slot, &item->m_completion);
                 break;
             case IoOperation::WriteFixed:
-                ok = m_ring.submit_write_fixed(item->fd, item->const_buffer,
-                                              item->length, item->slot,
-                                              &item->completion);
+                ok = m_ring.submit_write_fixed(item->m_fd, item->m_const_buffer,
+                                              item->m_length, item->m_slot,
+                                              &item->m_completion);
                 break;
             case IoOperation::Connect:
-                ok = m_ring.submit_connect(item->fd, item->address,
-                                          item->address_length, &item->completion);
+                ok = m_ring.submit_connect(item->m_fd, item->m_address,
+                                          item->m_address_length, &item->m_completion);
                 break;
             case IoOperation::Accept:
-                ok = m_ring.submit_accept(item->fd, const_cast<sockaddr*>(item->address),
-                                         item->result_length, &item->completion);
+                ok = m_ring.submit_accept(item->m_fd, const_cast<sockaddr*>(item->m_address),
+                                         item->m_result_length, &item->m_completion);
                 break;
             case IoOperation::Recv:
-                ok = m_ring.submit_recv(item->fd, item->buffer, item->length,
-                                       item->flags, &item->completion);
+                ok = m_ring.submit_recv(item->m_fd, item->m_buffer, item->m_length,
+                                       item->m_flags, &item->m_completion);
                 break;
             case IoOperation::Send:
-                ok = m_ring.submit_send(item->fd, item->const_buffer, item->length,
-                                       item->flags, &item->completion);
+                ok = m_ring.submit_send(item->m_fd, item->m_const_buffer, item->m_length,
+                                       item->m_flags, &item->m_completion);
                 break;
         }
         if (!ok) {
-            m_runtime->post_completion(m_worker_id, item->completion.task);
+            m_runtime->post_completion(m_worker_id, item->m_completion.m_task);
             m_runtime->note_io_completed(m_worker_id);
         } else {
             submitted = true;
@@ -187,9 +187,9 @@ bool SocketIo::reap() noexcept {
             static_cast<IoCompletion*>(io_uring_cqe_get_data(cqe));
         const int cqe_result = cqe->res;
         m_ring.mark_seen(cqe);
-        if (completion != nullptr) completion->result = cqe_result;
-        if (completion != nullptr && completion->task != nullptr) {
-            m_runtime->post_completion(m_worker_id, completion->task);
+        if (completion != nullptr) completion->m_result = cqe_result;
+        if (completion != nullptr && completion->m_task != nullptr) {
+            m_runtime->post_completion(m_worker_id, completion->m_task);
         }
         // Publish the completion before decrementing pending_io: a worker that
         // observes zero pending operations then cannot miss the posted task,

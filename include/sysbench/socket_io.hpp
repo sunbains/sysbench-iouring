@@ -44,17 +44,17 @@ enum class IoOperation : std::uint8_t {
 };
 
 struct IoRequest {
-    IoOperation operation = IoOperation::ReadFixed;
-    int fd = -1;
-    void* buffer = nullptr;
-    const void* const_buffer = nullptr;
-    unsigned length = 0;
-    int flags = 0;
-    int slot = 0;
-    const sockaddr* address = nullptr;
-    socklen_t address_length = 0;
-    socklen_t* result_length = nullptr;
-    IoCompletion completion{};
+    IoOperation m_operation = IoOperation::ReadFixed;
+    int m_fd = -1;
+    void* m_buffer = nullptr;
+    const void* m_const_buffer = nullptr;
+    unsigned m_length = 0;
+    int m_flags = 0;
+    int m_slot = 0;
+    const sockaddr* m_address = nullptr;
+    socklen_t m_address_length = 0;
+    socklen_t* m_result_length = nullptr;
+    IoCompletion m_completion{};
 };
 
 class SocketIo : public IoReaper {
@@ -113,15 +113,15 @@ public:
     SocketReadAwaiter(SocketIo& io, int fd, void* buffer, unsigned length,
                       int slot)
         : m_io(&io) {
-        m_request.operation = IoOperation::ReadFixed;
-        m_request.fd = fd;
-        m_request.buffer = buffer;
-        m_request.length = length;
-        m_request.slot = slot;
+        m_request.m_operation = IoOperation::ReadFixed;
+        m_request.m_fd = fd;
+        m_request.m_buffer = buffer;
+        m_request.m_length = length;
+        m_request.m_slot = slot;
     }
     [[nodiscard]] bool await_ready() const noexcept { return false; }
     void await_suspend(std::coroutine_handle<>) noexcept;
-    [[nodiscard]] int await_resume() const noexcept { return m_request.completion.result; }
+    [[nodiscard]] int await_resume() const noexcept { return m_request.m_completion.m_result; }
 
 private:
     SocketIo* m_io;
@@ -133,15 +133,15 @@ public:
     SocketWriteAwaiter(SocketIo& io, int fd, const void* buffer, unsigned length,
                        int slot)
         : m_io(&io) {
-        m_request.operation = IoOperation::WriteFixed;
-        m_request.fd = fd;
-        m_request.const_buffer = buffer;
-        m_request.length = length;
-        m_request.slot = slot;
+        m_request.m_operation = IoOperation::WriteFixed;
+        m_request.m_fd = fd;
+        m_request.m_const_buffer = buffer;
+        m_request.m_length = length;
+        m_request.m_slot = slot;
     }
     [[nodiscard]] bool await_ready() const noexcept { return false; }
     void await_suspend(std::coroutine_handle<>) noexcept;
-    [[nodiscard]] int await_resume() const noexcept { return m_request.completion.result; }
+    [[nodiscard]] int await_resume() const noexcept { return m_request.m_completion.m_result; }
 
 private:
     SocketIo* m_io;
@@ -153,14 +153,14 @@ public:
     SocketConnectAwaiter(SocketIo& io, int fd, const sockaddr* address,
                          socklen_t length)
         : m_io(&io) {
-        m_request.operation = IoOperation::Connect;
-        m_request.fd = fd;
-        m_request.address = address;
-        m_request.address_length = length;
+        m_request.m_operation = IoOperation::Connect;
+        m_request.m_fd = fd;
+        m_request.m_address = address;
+        m_request.m_address_length = length;
     }
     [[nodiscard]] bool await_ready() const noexcept { return false; }
     void await_suspend(std::coroutine_handle<>) noexcept;
-    [[nodiscard]] int await_resume() const noexcept { return m_request.completion.result; }
+    [[nodiscard]] int await_resume() const noexcept { return m_request.m_completion.m_result; }
 
 private:
     SocketIo* m_io;
@@ -172,14 +172,14 @@ public:
     SocketAcceptAwaiter(SocketIo& io, int fd, sockaddr* address,
                         socklen_t* length)
         : m_io(&io) {
-        m_request.operation = IoOperation::Accept;
-        m_request.fd = fd;
-        m_request.address = address;
-        m_request.result_length = length;
+        m_request.m_operation = IoOperation::Accept;
+        m_request.m_fd = fd;
+        m_request.m_address = address;
+        m_request.m_result_length = length;
     }
     [[nodiscard]] bool await_ready() const noexcept { return false; }
     void await_suspend(std::coroutine_handle<>) noexcept;
-    [[nodiscard]] int await_resume() const noexcept { return m_request.completion.result; }
+    [[nodiscard]] int await_resume() const noexcept { return m_request.m_completion.m_result; }
 
 private:
     SocketIo* m_io;
@@ -191,15 +191,15 @@ public:
     SocketRecvAwaiter(SocketIo& io, int fd, void* buffer, unsigned length,
                       int flags)
         : m_io(&io) {
-        m_request.operation = IoOperation::Recv;
-        m_request.fd = fd;
-        m_request.buffer = buffer;
-        m_request.length = length;
-        m_request.flags = flags;
+        m_request.m_operation = IoOperation::Recv;
+        m_request.m_fd = fd;
+        m_request.m_buffer = buffer;
+        m_request.m_length = length;
+        m_request.m_flags = flags;
     }
     [[nodiscard]] bool await_ready() const noexcept { return false; }
     void await_suspend(std::coroutine_handle<>) noexcept;
-    [[nodiscard]] int await_resume() const noexcept { return m_request.completion.result; }
+    [[nodiscard]] int await_resume() const noexcept { return m_request.m_completion.m_result; }
 
 private:
     SocketIo* m_io;
@@ -211,15 +211,15 @@ public:
     SocketSendAwaiter(SocketIo& io, int fd, const void* buffer, unsigned length,
                       int flags)
         : m_io(&io) {
-        m_request.operation = IoOperation::Send;
-        m_request.fd = fd;
-        m_request.const_buffer = buffer;
-        m_request.length = length;
-        m_request.flags = flags;
+        m_request.m_operation = IoOperation::Send;
+        m_request.m_fd = fd;
+        m_request.m_const_buffer = buffer;
+        m_request.m_length = length;
+        m_request.m_flags = flags;
     }
     [[nodiscard]] bool await_ready() const noexcept { return false; }
     void await_suspend(std::coroutine_handle<>) noexcept;
-    [[nodiscard]] int await_resume() const noexcept { return m_request.completion.result; }
+    [[nodiscard]] int await_resume() const noexcept { return m_request.m_completion.m_result; }
 
 private:
     SocketIo* m_io;

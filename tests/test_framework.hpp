@@ -31,8 +31,8 @@
 namespace sb::test {
 
 struct TestCase {
-    const char* name;
-    void (*function)();
+    const char* m_name;
+    void (*m_function)();
 };
 
 inline TestCase* registry() {
@@ -102,15 +102,15 @@ inline int run_all(int argc, char** argv) {
     int ran = 0;
     for (int i = 0; i < registry_size(); ++i) {
         const TestCase& test = registry()[i];
-        if (!filter.empty() && std::string_view(test.name).find(filter) ==
+        if (!filter.empty() && std::string_view(test.m_name).find(filter) ==
                                    std::string_view::npos) {
             continue;
         }
-        current_test() = test.name;
+        current_test() = test.m_name;
         const int before = failures().load(std::memory_order_relaxed);
-        std::println("[ RUN      ] {}", test.name);
+        std::println("[ RUN      ] {}", test.m_name);
         try {
-            test.function();
+            test.m_function();
         } catch (const std::exception& error) {
             failures().fetch_add(1, std::memory_order_relaxed);
             std::println(stderr, "  FAIL exception: {}", error.what());
@@ -119,7 +119,7 @@ inline int run_all(int argc, char** argv) {
             std::println(stderr, "  FAIL unknown exception");
         }
         const bool ok = failures().load(std::memory_order_relaxed) == before;
-        std::println("[ {} ] {}", ok ? "       OK" : "  FAILED", test.name);
+        std::println("[ {} ] {}", ok ? "       OK" : "  FAILED", test.m_name);
         ++ran;
     }
     const int failure_count = failures().load(std::memory_order_relaxed);

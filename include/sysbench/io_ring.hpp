@@ -40,8 +40,8 @@ namespace sb {
 class IoRing;
 
 struct IoCompletion {
-    detail::PromiseBase* task = nullptr;
-    int result = 0;
+    detail::PromiseBase* m_task = nullptr;
+    int m_result = 0;
 };
 
 class IoRing {
@@ -146,8 +146,8 @@ private:
     friend class RegisteredBufferLease;
 
     struct Slot {
-        void* data = nullptr;
-        bool in_use = false;
+        void* m_data = nullptr;
+        bool m_in_use = false;
     };
 
     IoRing* m_ring;
@@ -184,7 +184,7 @@ public:
 
     [[nodiscard]] bool valid() const noexcept { return m_pool != nullptr; }
     [[nodiscard]] void* data() const noexcept {
-        return m_pool != nullptr ? m_pool->m_slots[m_slot].data : nullptr;
+        return m_pool != nullptr ? m_pool->m_slots[m_slot].m_data : nullptr;
     }
     [[nodiscard]] unsigned size() const noexcept {
         return m_pool != nullptr ? m_pool->m_slot_size : 0;

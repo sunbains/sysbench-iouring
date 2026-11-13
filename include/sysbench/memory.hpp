@@ -49,12 +49,12 @@ inline constexpr std::size_t kCacheLine = 64;
 inline constexpr std::size_t kDefaultAlignment = alignof(std::max_align_t);
 
 struct ResourceStats {
-    std::size_t capacity = 0;
-    std::size_t used = 0;
-    std::size_t peak = 0;
-    std::size_t allocations = 0;
-    std::size_t frees = 0;
-    std::size_t failed = 0;
+    std::size_t m_capacity = 0;
+    std::size_t m_used = 0;
+    std::size_t m_peak = 0;
+    std::size_t m_allocations = 0;
+    std::size_t m_frees = 0;
+    std::size_t m_failed = 0;
 };
 
 class MemoryResource {
@@ -136,12 +136,12 @@ public:
 
 private:
     struct alignas(16) Block {
-        std::uint32_t size = 0;       // total block size, including this header
-        std::uint32_t prev_size = 0;  // total size of previous block, 0 if first
-        std::uint32_t is_free = 0;
-        std::uint32_t bin = 0;
-        Block* next_free = nullptr;
-        Block* prev_free = nullptr;
+        std::uint32_t m_size = 0;       // total block size, including this header
+        std::uint32_t m_prev_size = 0;  // total size of previous block, 0 if first
+        std::uint32_t m_is_free = 0;
+        std::uint32_t m_bin = 0;
+        Block* m_next_free = nullptr;
+        Block* m_prev_free = nullptr;
     };
 
     static constexpr std::uint32_t kUsedBin = std::numeric_limits<std::uint32_t>::max();
@@ -179,9 +179,9 @@ private:
 class BumpArena final : public MemoryResource {
 public:
     struct Mark {
-        void* block = nullptr;
-        std::size_t used = 0;
-        std::size_t generation = 0;
+        void* m_block = nullptr;
+        std::size_t m_used = 0;
+        std::size_t m_generation = 0;
     };
 
     BumpArena(MemoryResource& parent, std::size_t block_size = 64 * 1024,
@@ -203,9 +203,9 @@ public:
 
 private:
     struct alignas(16) Block {
-        Block* next = nullptr;
-        std::size_t capacity = 0;
-        std::size_t used = 0;
+        Block* m_next = nullptr;
+        std::size_t m_capacity = 0;
+        std::size_t m_used = 0;
     };
 
     static constexpr std::size_t kHeader = sizeof(Block);
