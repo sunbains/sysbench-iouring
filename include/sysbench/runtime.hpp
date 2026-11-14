@@ -211,11 +211,9 @@ private:
     ShardedCounter<std::uint64_t, kMaxWorkers> m_resumes;
     std::atomic<std::uint32_t> m_active_tasks{0};
     std::atomic<bool> m_undersubscribed{true};
-    // Workers currently inside resume().  A stalled benchmark has none: every
-    // task is suspended waiting for a completion that will never arrive.
-    std::atomic<std::uint32_t> m_busy_workers{0};
     std::chrono::milliseconds m_stall_timeout{0};
     std::int64_t m_last_outstanding{-1};
+    std::uint64_t m_last_resumes{0};
     std::chrono::steady_clock::time_point m_idle_since{};
     std::atomic<bool> m_stall_detected{false};
     int m_wait_event_fd = -1;

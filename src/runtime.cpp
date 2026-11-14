@@ -243,9 +243,7 @@ struct alignas(4096) Runtime::Worker {
     void resume(PromiseBase* task) noexcept {
         detail::tls_worker = this;
         detail::tls_current = task;
-        m_runtime->m_busy_workers.fetch_add(1, std::memory_order_relaxed);
         task->m_self.resume();
-        m_runtime->m_busy_workers.fetch_sub(1, std::memory_order_relaxed);
         detail::tls_current = nullptr;
         m_runtime->m_resumes.add(m_id, 1);
     }
@@ -653,9 +651,14 @@ bool Runtime::check_stall(std::int64_t outstanding) {
 
     const auto now = Clock::now();
 
-    if (outstanding != m_last_outstanding ||
-        m_busy_workers.load(std::memory_order_acquire) != 0) {
+    // Resumes is sharded per worker: counting it here costs nothing on the
+    // hot path, where a shared counter incremented around every resume is a
+    // cache line every worker fights over.
+    const auto resumes = m_resumes.sum(m_worker_count);
+
+    if (outstanding != m_last_outstanding || resumes != m_last_resumes) {
         m_last_outstanding = outstanding;
+        m_last_resumes = resumes;
         m_idle_since = now;
         return false;
     }
