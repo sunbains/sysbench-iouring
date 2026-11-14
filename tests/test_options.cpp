@@ -39,9 +39,12 @@ TEST("defaults and typed setters") {
     Options options(heap);
     CHECK_EQ(options.as_int("threads"), 1);
     CHECK_EQ(options.as_string("db-driver"), "mysql");
+    CHECK_EQ(options.as_int("mysql-protocol"), 1);
     CHECK_EQ(options.as_size("memory-size"), 4096ull * 1024 * 1024);
     mem::String error{mem::Allocator<char>(&heap)};
     CHECK(options.set("threads", "16", error));
+    CHECK(options.set("mysql-protocol", "2", error));
+    CHECK_EQ(options.as_int("mysql-protocol"), 2);
     CHECK_EQ(options.as_int("threads"), 16);
     CHECK(options.set("histogram", "on", error));
     CHECK(options.as_bool("histogram"));

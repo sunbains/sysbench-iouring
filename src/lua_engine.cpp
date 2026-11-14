@@ -15,7 +15,9 @@
 // Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
 #include <print>
+#include "sysbench/layer_stats.hpp"
 #include "sysbench/lua.hpp"
+#include "sysbench/memory.hpp"
 
 #include "sysbench/db.hpp"
 #include "sysbench/io_ring.hpp"
@@ -126,7 +128,7 @@ private:
     std::uint64_t m_unique = 0;
 };
 
-constexpr std::uint32_t kMaxBenchmarkThreads = 16384;
+constexpr std::uint32_t kMaxBenchmarkThreads = 32768;
 
 struct RunControl {
     Clock::time_point m_start{};
@@ -137,6 +139,8 @@ struct RunControl {
     bool m_fair_yield = false;
     ShardedCounter<std::uint64_t, kMaxBenchmarkThreads> m_events;
     alignas(mem::kCacheLine) std::atomic<bool> m_stop{false};
+    // Benchmark tasks still running; the reporter task exits at zero.
+    alignas(mem::kCacheLine) std::atomic<std::uint32_t> m_remaining{0};
 
     [[nodiscard]] bool stats_enabled(Clock::time_point now) const noexcept {
         return now >= m_warmup_end;
@@ -156,9 +160,13 @@ enum class PendingKind {
     None,
     Connect,
     Query,
+    QueryStream,
     Prepare,
     Reconnect,
     Execute,
+    QuerySend,
+    ExecuteSend,
+    Flush,
     CloseStatement,
     BulkInsert,
     Sleep,
@@ -171,6 +179,8 @@ struct Pending {
     LuaConnection* m_connection = nullptr;
     LuaStatement* m_statement = nullptr;
     std::uint64_t m_sleep_ns = 0;
+    std::uint32_t m_stream_depth = 1;
+    std::uint64_t m_stream_total = 0;
     bool m_bool_result = false;
 };
 
@@ -210,26 +220,47 @@ struct LuaConnection {
     mem::MemoryResource* m_resource = nullptr;
     LuaVm* m_vm = nullptr;
     bool m_closed = false;
+    /* Pipelining (con:pipeline(depth)): with a depth above 1, query() and
+    execute() write the command and return at once; a reply is read only when
+    `depth` commands are outstanding.  Any other operation on the connection
+    first reads every outstanding reply. */
+    std::uint32_t m_pipeline_depth = 0;
     int m_error_kind = 0;
     int m_error_code = 0;
     char m_error_state[6] = "HY000";
     char m_error_message[1024]{};
-    mem::String m_bulk_prefix;
-    mem::String m_bulk_rows;
+    /* A bulk INSERT is assembled in a request heap the connection owns, carved
+    from the root on the connection's node when the first bulk insert starts.
+    The statement (prefix, then rows) is built in place and sent from there, so
+    neither the Lua heap nor the connection heap ever holds it. */
+    static constexpr std::size_t kBulkFlushBytes = 1024 * 1024;
+    static constexpr std::size_t kBulkHeapBytes = 4 * kBulkFlushBytes;
+    struct BulkRequest {
+        mem::HeapArena m_heap;
+        mem::String m_sql;
+        std::size_t m_prefix_length = 0;
+        explicit BulkRequest(int node)
+            : m_heap(mem::global_root(), kBulkHeapBytes, "bulk-request", node),
+              m_sql(mem::Allocator<char>(&m_heap)) {
+            m_sql.reserve(kBulkFlushBytes + 64 * 1024);
+        }
+        [[nodiscard]] bool has_rows() const noexcept { return m_sql.size() > m_prefix_length; }
+        void restart() { m_sql.resize(m_prefix_length); }
+    };
+    std::optional<BulkRequest> m_bulk;
 
     LuaConnection(mem::MemoryResource& owner, LuaVm* context)
-        : m_resource(&owner),
-          m_vm(context),
-          m_bulk_prefix(mem::Allocator<char>(&owner)),
-          m_bulk_rows(mem::Allocator<char>(&owner)) {}
+        : m_resource(&owner), m_vm(context) {}
 
-    ~LuaConnection() {
-        if (m_connection != nullptr) {
-            m_connection->close();
-            m_connection->destroy(*m_resource);
-            m_connection = nullptr;
-        }
-    }
+    /* The connection's single current result, as in stock sysbench: one
+    LuaResult and one result userdata, created on the first query and reused by
+    every later one (valid until the connection's next query).  No allocation
+    per query. */
+    LuaResult* m_result = nullptr;
+    void** m_result_box = nullptr;
+    int m_result_ref = LUA_NOREF;
+
+    ~LuaConnection();
 
     void clear_error() noexcept {
         m_error_kind = 0;
@@ -262,6 +293,23 @@ struct LuaStatement {
     }
 };
 
+// The statement's bound Lua parameters as driver values.
+void bind_values(const LuaStatement& statement, db::BindValue* values) noexcept {
+    for (std::size_t i = 0; i < statement.m_parameter_count; ++i) {
+        const LuaParam* parameter = statement.m_parameters[i];
+        if (parameter == nullptr || parameter->m_is_null) {
+            values[i] = db::BindValue::null();
+        } else if (parameter->m_kind == LuaParam::Kind::Integer) {
+            values[i] = db::BindValue::from_int(parameter->m_integer);
+        } else if (parameter->m_kind == LuaParam::Kind::Real) {
+            values[i] = db::BindValue::from_double(parameter->m_real);
+        } else {
+            values[i] = db::BindValue::from_bytes(
+                std::string_view(parameter->m_buffer, parameter->m_length));
+        }
+    }
+}
+
 // Result storage lives in the VM's per-event bump arena.  Its destructor is
 // deliberately never run: Lua's GC is asynchronous while the arena is rewound
 // at the next event.  Results therefore have event lifetime, matching the way
@@ -275,6 +323,38 @@ struct LuaResult {
     ~LuaResult() = default;
 };
 
+LuaConnection::~LuaConnection() {
+    if (m_connection != nullptr) {
+        m_connection->close();
+        m_connection->destroy(*m_resource);
+        m_connection = nullptr;
+    }
+    /* The result userdata may outlive the connection (a script can hold it):
+    detach it.  Its memory stays valid until every finalizer has run. */
+    if (m_result_box != nullptr) *m_result_box = nullptr;
+    if (m_result != nullptr) mem::destroy(*m_resource, m_result);
+}
+
+void push_handle_box(lua_State* L, const char* meta, void* object);
+
+// Make `set` the connection's current result and push its (reused) userdata.
+void push_result(lua_State* L, LuaConnection& connection, db::ResultSet&& set) {
+    if (connection.m_result == nullptr) {
+        connection.m_result = mem::construct<LuaResult>(*connection.m_resource, std::move(set));
+    } else {
+        std::destroy_at(connection.m_result);
+        std::construct_at(connection.m_result, std::move(set));
+    }
+    if (connection.m_result_ref == LUA_NOREF) {
+        push_handle_box(L, "sysbench.result.handle", connection.m_result);
+        connection.m_result_box = static_cast<void**>(lua_touserdata(L, -1));
+        lua_pushvalue(L, -1);
+        connection.m_result_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    } else {
+        lua_rawgeti(L, LUA_REGISTRYINDEX, connection.m_result_ref);
+    }
+}
+
 struct LuaHistogram {
     LatencyHistogram m_histogram;
     mem::MemoryResource* m_resource = nullptr;
@@ -287,6 +367,23 @@ struct LuaHistogram {
 
 class LuaVm {
 public:
+    /* Metatables of the sysbench handle types, cached on first use so that
+    checking a handle compares two pointers instead of looking its type name up
+    in the registry (which interns the name string) on every call. */
+    [[nodiscard]] const void* metatable_for(lua_State* L, const char* meta) {
+        for (std::size_t i = 0; i < kMetaSlots; ++i) {
+            if (m_meta_names[i] == meta) return m_meta_tables[i];
+            if (m_meta_names[i] == nullptr) {
+                luaL_getmetatable(L, meta);
+                m_meta_tables[i] = lua_topointer(L, -1);
+                lua_pop(L, 1);
+                m_meta_names[i] = meta;
+                return m_meta_tables[i];
+            }
+        }
+        return nullptr;
+    }
+
     LuaVm(mem::MemoryResource& resource, Options& options,
           const LuaRunOptions& run_options, std::string_view script_path,
           std::string_view command, int argc, char** argv, std::uint32_t tid,
@@ -295,6 +392,11 @@ public:
 
     LuaVm(const LuaVm&) = delete;
     LuaVm& operator=(const LuaVm&) = delete;
+
+    // Where the MySQL session is allocated (the connection heap).
+    void set_session_resource(mem::MemoryResource& resource) noexcept {
+        m_session_resource = &resource;
+    }
 
     bool load(mem::String& error);
     bool install_options(mem::String& error);
@@ -339,6 +441,9 @@ public:
     bool m_has_last_error = false;
 
     Task<int> perform_pending(lua_State* coroutine);
+    // Read pipelined replies until at most `keep` are outstanding.  False
+    // (connection error set) when one fails.
+    Task<bool> read_replies(LuaConnection* connection, std::uint32_t keep);
 
     bool tick_more_events() noexcept {
         ++m_more_events_calls;
@@ -409,6 +514,7 @@ private:
     mem::MemoryResource* m_resource;
     Options* m_options;
     mem::BumpArena m_event_arena;
+    mem::MemoryResource* m_session_resource = nullptr;
     mem::ScopedAllocator m_event_scope;
     LuaRunOptions m_run_options;
     mem::String m_script_path;
@@ -428,6 +534,9 @@ private:
     std::uint64_t m_event_check_batch = 1;
     std::int64_t m_rate_slot_ns = 0;
     std::int64_t m_rate_interval_ns = 0;
+    static constexpr std::size_t kMetaSlots = 8;
+    const char* m_meta_names[kMetaSlots]{};
+    const void* m_meta_tables[kMetaSlots]{};
 };
 
 // ---------------------------------------------------------------------------
@@ -452,6 +561,24 @@ void* lua_allocate(void* user, void* pointer, std::size_t old_size,
     }
 }
 
+/* LuaJIT (Lua 5.1 API) helpers. */
+
+// A number with an integral value (LuaJIT numbers are doubles).
+[[nodiscard]] bool is_integral(lua_State* L, int index) noexcept {
+    if (lua_type(L, index) != LUA_TNUMBER) return false;
+    const lua_Number value = lua_tonumber(L, index);
+    return value == static_cast<lua_Number>(static_cast<lua_Integer>(value));
+}
+
+// luaL_tolstring for Lua 5.1: push tostring(value at index) and return it.
+const char* to_display_string(lua_State* L, int index) {
+    index = index < 0 && index > LUA_REGISTRYINDEX ? lua_gettop(L) + index + 1 : index;
+    lua_getglobal(L, "tostring");
+    lua_pushvalue(L, index);
+    if (lua_pcall(L, 1, 1, 0) != 0) return lua_tostring(L, -1);
+    return lua_tostring(L, -1);
+}
+
 constexpr const char* kDriverMeta = "sysbench.driver.handle";
 constexpr const char* kConnectionMeta = "sysbench.connection.handle";
 constexpr const char* kStatementMeta = "sysbench.statement.handle";
@@ -468,6 +595,18 @@ LuaVm* current_vm(lua_State* L) {
 
 template <class T>
 T* check_handle(lua_State* L, int index, const char* meta) {
+    /* Fast path: compare the userdata's metatable with this VM's cached one.
+    Anything else (wrong type, another VM) takes luaL_checkudata's path, which
+    also produces its error message. */
+    if (LuaVm* vm = tls_vm; vm != nullptr && lua_type(L, index) == LUA_TUSERDATA &&
+                            lua_getmetatable(L, index)) {
+        const void* table = lua_topointer(L, -1);
+        lua_pop(L, 1);
+        if (table != nullptr && table == vm->metatable_for(L, meta)) {
+            void** box = static_cast<void**>(lua_touserdata(L, index));
+            if (*box != nullptr) return static_cast<T*>(*box);
+        }
+    }
     void** box = static_cast<void**>(luaL_checkudata(L, index, meta));
     if (box == nullptr || *box == nullptr) {
         luaL_error(L, "invalid sysbench handle");
@@ -475,9 +614,16 @@ T* check_handle(lua_State* L, int index, const char* meta) {
     return static_cast<T*>(*box);
 }
 
+void push_handle_box(lua_State* L, const char* meta, void* object) {
+    void** box = static_cast<void**>(lua_newuserdata(L, sizeof(void*)));
+    *box = object;
+    luaL_getmetatable(L, meta);
+    lua_setmetatable(L, -2);
+}
+
 template <class T>
 void push_handle(lua_State* L, const char* meta, T* object) {
-    void** box = static_cast<void**>(lua_newuserdatauv(L, sizeof(void*), 0));
+    void** box = static_cast<void**>(lua_newuserdata(L, sizeof(void*)));
     *box = object;
     luaL_getmetatable(L, meta);
     lua_setmetatable(L, -2);
@@ -930,6 +1076,7 @@ namespace {
 
 template <class Function>
 int protected_call(lua_State* L, Function&& function) {
+    SB_LAYER(LuaBinding);
     try {
         return function();
     } catch (const std::exception& error) {
@@ -1190,6 +1337,63 @@ int l_sql_reconnect(lua_State* L) {
     });
 }
 
+int l_sql_query_stream(lua_State* L) {
+    return protected_call(L, [&] {
+        LuaVm* vm = current_vm(L);
+        auto* connection = check_handle<LuaConnection>(L, 1, kConnectionMeta);
+        std::size_t length = 0;
+        const char* query = luaL_checklstring(L, 2, &length);
+        const auto depth = static_cast<std::uint32_t>(
+            std::max<lua_Integer>(1, luaL_checkinteger(L, 3)));
+        const auto total = static_cast<std::uint64_t>(
+            std::max<lua_Integer>(0, luaL_checkinteger(L, 4)));
+        if (connection->m_connection == nullptr || connection->m_closed) {
+            connection->set_error(db::Error("MySQL connection is closed", 2006), false);
+            lua_pushboolean(L, 0);
+            return 1;
+        }
+        vm->m_sql_buffer.assign(query, length);
+        if (vm->stats() != nullptr && vm->stats_enabled()) {
+            const auto kind = classify_query(vm->m_sql_buffer);
+            for (std::uint64_t i = 0; i < total; ++i) vm->stats()->record_query(kind);
+        }
+        vm->m_pending = Pending{};
+        vm->m_pending.m_kind = PendingKind::QueryStream;
+        vm->m_pending.m_connection = connection;
+        vm->m_pending.m_stream_depth = depth;
+        vm->m_pending.m_stream_total = total;
+        return lua_yield(L, 0);
+    });
+}
+
+// con:pipeline(depth): keep up to `depth` commands in flight (1 or 0: off).
+int l_sql_pipeline(lua_State* L) {
+    return protected_call(L, [&] {
+        auto* connection = check_handle<LuaConnection>(L, 1, kConnectionMeta);
+        connection->m_pipeline_depth = static_cast<std::uint32_t>(
+            std::clamp<lua_Integer>(luaL_checkinteger(L, 2), 0, 256));
+        lua_pushboolean(L, 1);
+        return 1;
+    });
+}
+
+// con:flush(): read every outstanding pipelined reply.
+int l_sql_flush(lua_State* L) {
+    return protected_call(L, [&] {
+        LuaVm* vm = current_vm(L);
+        auto* connection = check_handle<LuaConnection>(L, 1, kConnectionMeta);
+        if (connection->m_connection == nullptr || connection->m_closed ||
+            connection->m_connection->pending_replies() == 0) {
+            lua_pushboolean(L, 1);
+            return 1;
+        }
+        vm->m_pending = Pending{};
+        vm->m_pending.m_kind = PendingKind::Flush;
+        vm->m_pending.m_connection = connection;
+        return lua_yield(L, 0);
+    });
+}
+
 int l_sql_query(lua_State* L) {
     return protected_call(L, [&] {
         LuaVm* vm = current_vm(L);
@@ -1202,11 +1406,13 @@ int l_sql_query(lua_State* L) {
             return 1;
         }
         vm->m_sql_buffer.assign(query, length);
+        SB_COUNT(Queries, 1);
         if (vm->stats() != nullptr && vm->stats_enabled()) {
             vm->stats()->record_query(classify_query(vm->m_sql_buffer));
         }
         vm->m_pending = Pending{};
-        vm->m_pending.m_kind = PendingKind::Query;
+        vm->m_pending.m_kind =
+            connection->m_pipeline_depth > 1 ? PendingKind::QuerySend : PendingKind::Query;
         vm->m_pending.m_connection = connection;
         return lua_yield(L, 0);
     });
@@ -1263,8 +1469,14 @@ int l_sql_bulk_insert_init(lua_State* L) {
         auto* connection = check_handle<LuaConnection>(L, 1, kConnectionMeta);
         std::size_t length = 0;
         const char* prefix = luaL_checklstring(L, 2, &length);
-        connection->m_bulk_prefix.assign(prefix, length);
-        connection->m_bulk_rows.clear();
+        if (!connection->m_bulk) {
+            Runtime& runtime = *Runtime::current();
+            connection->m_bulk.emplace(
+                runtime.worker_numa_node(Runtime::current_worker_id()));
+        }
+        auto& bulk = *connection->m_bulk;
+        bulk.m_sql.assign(prefix, length);
+        bulk.m_prefix_length = length;
         lua_pushboolean(L, 1);
         return 1;
     });
@@ -1276,9 +1488,13 @@ int l_sql_bulk_insert_next(lua_State* L) {
         auto* connection = check_handle<LuaConnection>(L, 1, kConnectionMeta);
         std::size_t length = 0;
         const char* row = luaL_checklstring(L, 2, &length);
-        if (!connection->m_bulk_rows.empty()) connection->m_bulk_rows.push_back(',');
-        connection->m_bulk_rows.append(row, length);
-        if (connection->m_bulk_rows.size() >= 1024 * 1024) {
+        if (!connection->m_bulk) {
+            return luaL_error(L, "bulk_insert_next() called before bulk_insert_init()");
+        }
+        auto& bulk = *connection->m_bulk;
+        if (bulk.has_rows()) bulk.m_sql.push_back(',');
+        bulk.m_sql.append(row, length);
+        if (bulk.m_sql.size() >= LuaConnection::kBulkFlushBytes) {
             vm->m_pending = Pending{};
             vm->m_pending.m_kind = PendingKind::BulkInsert;
             vm->m_pending.m_connection = connection;
@@ -1293,7 +1509,7 @@ int l_sql_bulk_insert_done(lua_State* L) {
     return protected_call(L, [&] {
         LuaVm* vm = current_vm(L);
         auto* connection = check_handle<LuaConnection>(L, 1, kConnectionMeta);
-        if (connection->m_bulk_rows.empty()) {
+        if (!connection->m_bulk || !connection->m_bulk->has_rows()) {
             lua_pushboolean(L, 1);
             return 1;
         }
@@ -1393,11 +1609,14 @@ int l_sql_execute(lua_State* L) {
             lua_pushnil(L);
             return 1;
         }
+        SB_COUNT(Queries, 1);
         if (vm->stats() != nullptr && vm->stats_enabled()) {
             vm->stats()->record_query(classify_query(statement->m_statement->sql()));
         }
         vm->m_pending = Pending{};
-        vm->m_pending.m_kind = PendingKind::Execute;
+        vm->m_pending.m_kind = statement->m_connection->m_pipeline_depth > 1
+                                   ? PendingKind::ExecuteSend
+                                   : PendingKind::Execute;
         vm->m_pending.m_statement = statement;
         vm->m_pending.m_connection = statement->m_connection;
         return lua_yield(L, 0);
@@ -1424,7 +1643,11 @@ int l_sql_result_info(lua_State* L) {
         auto* result = check_handle<LuaResult>(L, 1, kResultMeta);
         lua_pushinteger(L, static_cast<lua_Integer>(result->m_result.m_rows.size()));
         lua_pushinteger(L, static_cast<lua_Integer>(result->m_result.m_columns.size()));
-        return 2;
+        lua_pushinteger(L, static_cast<lua_Integer>(result->m_result.m_affected_rows));
+        lua_pushinteger(L, static_cast<lua_Integer>(result->m_result.m_last_insert_id));
+        lua_pushinteger(L, static_cast<lua_Integer>(result->m_result.m_warnings));
+        lua_pushinteger(L, static_cast<lua_Integer>(result->m_result.m_status));
+        return 6;
     });
 }
 
@@ -1441,7 +1664,7 @@ int l_sql_result_fetch_row(lua_State* L) {
             const db::Field& field = row.m_fields[i];
             if (field.m_is_null) lua_pushnil(L);
             else lua_pushlstring(L, field.m_data, field.m_length);
-            lua_rawseti(L, -2, static_cast<lua_Integer>(i + 1));
+            lua_rawseti(L, -2, static_cast<int>(i + 1));
         }
         return 1;
     });
@@ -1511,6 +1734,10 @@ int gc_connection(lua_State* L) {
     auto** box = static_cast<void**>(luaL_checkudata(L, 1, kConnectionMeta));
     if (box != nullptr && *box != nullptr) {
         auto* connection = static_cast<LuaConnection*>(*box);
+        if (connection->m_result_ref != LUA_NOREF) {
+            luaL_unref(L, LUA_REGISTRYINDEX, connection->m_result_ref);
+            connection->m_result_ref = LUA_NOREF;
+        }
         mem::destroy(*connection->m_resource, connection);
         *box = nullptr;
     }
@@ -1575,6 +1802,9 @@ const luaL_Reg kApiFunctions[] = {
     {"sb_sql_disconnect", l_sql_disconnect},
     {"sb_sql_reconnect", l_sql_reconnect},
     {"sb_sql_query", l_sql_query},
+    {"sb_sql_query_stream", l_sql_query_stream},
+    {"sb_sql_pipeline", l_sql_pipeline},
+    {"sb_sql_flush", l_sql_flush},
     {"sb_sql_conn_error", l_sql_conn_error},
     {"sb_last_error", l_last_error},
     {"sb_sql_prepare", l_sql_prepare},
@@ -1599,7 +1829,7 @@ const luaL_Reg kApiFunctions[] = {
 
 bool LuaVm::register_api(mem::String& error) {
     (void)error;
-    lua_pushglobaltable(m_state);
+    lua_pushvalue(m_state, LUA_GLOBALSINDEX);
     luaL_setfuncs(m_state, kApiFunctions, 0);
     lua_pop(m_state, 1);
 
@@ -1627,15 +1857,92 @@ bool LuaVm::register_api(mem::String& error) {
 namespace sb {
 namespace {
 
+Task<bool> LuaVm::read_replies(LuaConnection* connection, std::uint32_t keep) {
+    while (connection->m_connection->pending_replies() > keep) {
+        auto status = co_await connection->m_connection->read_reply(result_resource());
+        if (status.is_err()) {
+            connection->set_error(status.error(), is_ignorable(status.error().code()));
+            if (m_stats != nullptr && stats_enabled()) m_stats->record_error();
+            co_return false;
+        }
+    }
+    co_return true;
+}
+
 Task<int> LuaVm::perform_pending(lua_State* coroutine) {
     Pending action = m_pending;
     m_pending = Pending{};
     try {
+        /* Anything but a pipelined send reads the connection's outstanding
+        replies first: the next reply on the wire is theirs. */
+        if (action.m_kind != PendingKind::QuerySend && action.m_kind != PendingKind::ExecuteSend &&
+            action.m_kind != PendingKind::Reconnect && action.m_connection != nullptr &&
+            action.m_connection->m_connection != nullptr &&
+            action.m_connection->m_connection->pending_replies() != 0) {
+            if (!co_await read_replies(action.m_connection, 0)) {
+                if (action.m_kind == PendingKind::Flush || action.m_kind == PendingKind::BulkInsert ||
+                    action.m_kind == PendingKind::QueryStream) {
+                    lua_pushboolean(coroutine, 0);
+                } else {
+                    lua_pushnil(coroutine);
+                }
+                co_return 1;
+            }
+        }
         switch (action.m_kind) {
+            case PendingKind::Flush:
+                action.m_connection->clear_error();
+                lua_pushboolean(coroutine, 1);
+                co_return 1;
+            case PendingKind::QuerySend: {
+                LuaConnection* connection = action.m_connection;
+                const std::uint32_t depth = connection->m_pipeline_depth;
+                if (connection->m_connection->pending_replies() >= depth &&
+                    !co_await read_replies(connection, depth - 1)) {
+                    lua_pushnil(coroutine);
+                    co_return 1;
+                }
+                auto status = co_await connection->m_connection->send_query(
+                    std::string_view(m_sql_buffer.data(), m_sql_buffer.size()), result_resource());
+                if (status.is_err()) {
+                    connection->set_error(status.error(), is_ignorable(status.error().code()));
+                    if (m_stats != nullptr && stats_enabled()) m_stats->record_error();
+                    lua_pushnil(coroutine);
+                    co_return 1;
+                }
+                connection->clear_error();
+                push_result(coroutine, *connection, db::ResultSet(result_resource()));
+                co_return 1;
+            }
+            case PendingKind::ExecuteSend: {
+                LuaStatement* statement = action.m_statement;
+                LuaConnection* connection = statement->m_connection;
+                const std::uint32_t depth = connection->m_pipeline_depth;
+                if (connection->m_connection->pending_replies() >= depth &&
+                    !co_await read_replies(connection, depth - 1)) {
+                    lua_pushnil(coroutine);
+                    co_return 1;
+                }
+                db::BindValue values[64];
+                bind_values(*statement, values);
+                auto status = co_await statement->m_statement->send_execute(
+                    std::span<const db::BindValue>(values, statement->m_parameter_count),
+                    result_resource());
+                if (status.is_err()) {
+                    connection->set_error(status.error(), is_ignorable(status.error().code()));
+                    if (m_stats != nullptr && stats_enabled()) m_stats->record_error();
+                    lua_pushnil(coroutine);
+                    co_return 1;
+                }
+                connection->clear_error();
+                push_result(coroutine, *connection, db::ResultSet(result_resource()));
+                co_return 1;
+            }
             case PendingKind::Connect: {
                 try {
                     auto connect_result = co_await action.m_driver->m_driver->connect(
-                        m_run_options.m_database, *m_resource);
+                        m_run_options.m_database,
+                        m_session_resource != nullptr ? *m_session_resource : *m_resource);
                     if (connect_result.is_err()) throw connect_result.error();
                     db::Connection* connection = connect_result.value();
                     auto* handle = mem::construct<LuaConnection>(
@@ -1657,16 +1964,31 @@ Task<int> LuaVm::perform_pending(lua_State* coroutine) {
                     auto query_result = co_await connection->m_connection->query(
                         std::string_view(m_sql_buffer.data(), m_sql_buffer.size()), out);
                     if (query_result.is_err()) throw query_result.error();
-                    db::ResultSet result = std::move(query_result.value());
                     connection->clear_error();
-                    void* storage = out.allocate(sizeof(LuaResult), alignof(LuaResult));
-                    auto* handle = ::new (storage) LuaResult(std::move(result));
-                    push_handle(coroutine, kResultMeta, handle);
+                    SB_LAYER(Dispatch);
+                    push_result(coroutine, *connection, std::move(query_result.value()));
                     co_return 1;
                 } catch (const db::Error& error) {
                     connection->set_error(error, is_ignorable(error.code()));
                     if (m_stats != nullptr && stats_enabled()) m_stats->record_error();
                     lua_pushnil(coroutine);
+                    co_return 1;
+                }
+            }
+            case PendingKind::QueryStream: {
+                LuaConnection* connection = action.m_connection;
+                try {
+                    auto status = co_await connection->m_connection->query_stream(
+                        std::string_view(m_sql_buffer.data(), m_sql_buffer.size()),
+                        action.m_stream_depth, action.m_stream_total, result_resource());
+                    if (status.is_err()) throw status.error();
+                    connection->clear_error();
+                    lua_pushboolean(coroutine, 1);
+                    co_return 1;
+                } catch (const db::Error& error) {
+                    connection->set_error(error, is_ignorable(error.code()));
+                    if (m_stats != nullptr && stats_enabled()) m_stats->record_error();
+                    lua_pushboolean(coroutine, 0);
                     co_return 1;
                 }
             }
@@ -1695,7 +2017,8 @@ Task<int> LuaVm::perform_pending(lua_State* coroutine) {
             case PendingKind::Reconnect: {
                 LuaConnection* connection = action.m_connection;
                 try {
-                    co_await connection->m_connection->reconnect();
+                    auto status = co_await connection->m_connection->reconnect();
+                    if (status.is_err()) throw status.error();
                     connection->clear_error();
                     if (m_stats != nullptr) m_stats->record_reconnect();
                     lua_pushboolean(coroutine, 1);
@@ -1712,28 +2035,14 @@ Task<int> LuaVm::perform_pending(lua_State* coroutine) {
                 try {
                     mem::MemoryResource& out = result_resource();
                     db::BindValue values[64];
-                    for (std::size_t i = 0; i < statement->m_parameter_count; ++i) {
-                        LuaParam* parameter = statement->m_parameters[i];
-                        if (parameter == nullptr || parameter->m_is_null) {
-                            values[i] = db::BindValue::null();
-                        } else if (parameter->m_kind == LuaParam::Kind::Integer) {
-                            values[i] = db::BindValue::from_int(parameter->m_integer);
-                        } else if (parameter->m_kind == LuaParam::Kind::Real) {
-                            values[i] = db::BindValue::from_double(parameter->m_real);
-                        } else {
-                            values[i] = db::BindValue::from_bytes(
-                                std::string_view(parameter->m_buffer, parameter->m_length));
-                        }
-                    }
+                    bind_values(*statement, values);
                     auto execute_result = co_await statement->m_statement->execute(
                         std::span<const db::BindValue>(values, statement->m_parameter_count),
                         out);
                     if (execute_result.is_err()) throw execute_result.error();
-                    db::ResultSet result = std::move(execute_result.value());
                     connection->clear_error();
-                    void* storage = out.allocate(sizeof(LuaResult), alignof(LuaResult));
-                    auto* handle = ::new (storage) LuaResult(std::move(result));
-                    push_handle(coroutine, kResultMeta, handle);
+                    SB_LAYER(Dispatch);
+                    push_result(coroutine, *connection, std::move(execute_result.value()));
                     co_return 1;
                 } catch (const db::Error& error) {
                     connection->set_error(error, is_ignorable(error.code()));
@@ -1755,21 +2064,20 @@ Task<int> LuaVm::perform_pending(lua_State* coroutine) {
             }
             case PendingKind::BulkInsert: {
                 LuaConnection* connection = action.m_connection;
+                auto& bulk = *connection->m_bulk;
                 try {
-                    m_sql_buffer.assign(connection->m_bulk_prefix);
-                    m_sql_buffer.append(connection->m_bulk_rows);
                     if (m_stats != nullptr && stats_enabled()) {
                         m_stats->record_query(QueryKind::Write);
                     }
                     auto bulk_result = co_await connection->m_connection->query(
-                        std::string_view(m_sql_buffer.data(), m_sql_buffer.size()),
+                        std::string_view(bulk.m_sql.data(), bulk.m_sql.size()),
                         result_resource());
                     if (bulk_result.is_err()) throw bulk_result.error();
-                    connection->m_bulk_rows.clear();
+                    bulk.restart();
                     connection->clear_error();
                     lua_pushboolean(coroutine, 1);
                 } catch (const db::Error& error) {
-                    connection->m_bulk_rows.clear();
+                    bulk.restart();
                     connection->set_error(error, is_ignorable(error.code()));
                     if (m_stats != nullptr && stats_enabled()) m_stats->record_error();
                     lua_pushboolean(coroutine, 0);
@@ -1810,7 +2118,7 @@ namespace {
         lua_pop(L, 1);
         return result;
     }
-    const char* text = luaL_tolstring(L, -1, nullptr);
+    const char* text = to_display_string(L, -1);
     if (text != nullptr) result.assign(text);
     lua_pop(L, 2);
     return result;
@@ -1871,9 +2179,12 @@ Task<bool> LuaVm::call_entry(std::string_view name, bool pass_tid,
         ++nargs;
     }
 
-    int nresults = 0;
     tls_vm = this;
-    int status = lua_resume(coroutine, m_state, nargs, &nresults);
+    int status = 0;
+    {
+        SB_LAYER(Lua);
+        status = lua_resume(coroutine, nargs);
+    }
     while (status == LUA_YIELD) {
         if (m_pending.m_kind == PendingKind::None) {
             luaL_unref(m_state, LUA_REGISTRYINDEX, reference);
@@ -1881,8 +2192,8 @@ Task<bool> LuaVm::call_entry(std::string_view name, bool pass_tid,
         }
         const int resumed = co_await perform_pending(coroutine);
         tls_vm = this;
-        nresults = 0;
-        status = lua_resume(coroutine, m_state, resumed, &nresults);
+        SB_LAYER(Lua);
+        status = lua_resume(coroutine, resumed);
     }
 
     if (status != LUA_OK) {
@@ -1966,7 +2277,7 @@ bool collect_lua_options(LuaVm& vm, Options& options, mem::String& error) {
         const char* name_text = lua_tolstring(L, -2, &name_length);
         std::string_view name(name_text, name_length);
 
-        lua_geti(L, -1, 1);
+        lua_rawgeti(L, -1, 1);
         std::string_view description;
         if (lua_isstring(L, -1)) {
             std::size_t length = 0;
@@ -1975,12 +2286,12 @@ bool collect_lua_options(LuaVm& vm, Options& options, mem::String& error) {
         }
         lua_pop(L, 1);
 
-        lua_geti(L, -1, 2);
+        lua_rawgeti(L, -1, 2);
         const int default_type = lua_type(L, -1);
         char default_buffer[64]{};
         std::string_view default_value;
 
-        lua_geti(L, -2, 3);
+        lua_rawgeti(L, -2, 3);
         int hint = 0;
         if (lua_isnumber(L, -1)) hint = static_cast<int>(lua_tointeger(L, -1));
         lua_pop(L, 1);
@@ -1996,7 +2307,7 @@ bool collect_lua_options(LuaVm& vm, Options& options, mem::String& error) {
             switch (default_type) {
                 case LUA_TBOOLEAN: type = OptionType::Bool; break;
                 case LUA_TNUMBER:
-                    type = lua_isinteger(L, -1) ? OptionType::Int
+                    type = is_integral(L, -1) ? OptionType::Int
                                                  : OptionType::Double;
                     break;
                 case LUA_TTABLE: type = OptionType::List; break;
@@ -2009,7 +2320,7 @@ bool collect_lua_options(LuaVm& vm, Options& options, mem::String& error) {
                 default_value = lua_toboolean(L, -1) ? "on" : "off";
                 break;
             case LUA_TNUMBER:
-                if (lua_isinteger(L, -1)) {
+                if (is_integral(L, -1)) {
                     const auto integer = lua_tointeger(L, -1);
                     const auto result = std::to_chars(default_buffer,
                                                       default_buffer + sizeof(default_buffer),
@@ -2185,7 +2496,48 @@ struct LuaEngine::Impl {
         const LuaRunOptions& run_options, std::string_view command,
         std::uint32_t index,
         ShardedCounter<std::uint32_t, Runtime::kMaxWorkers>* failures);
+    // Interim reports, run as a task on a worker: no main-thread loop.
+    // The console thread: print a report every interval until the run ends.
+    // @return false when the run stopped on a stall.
+    bool report_until_done(Runtime& runtime, const LuaRunOptions& run_options,
+                           ThreadStats** pointers, std::uint32_t threads,
+                           RunControl* control);
 };
+
+/* Runs on the calling (console) thread, never on a worker: it sleeps on the
+runtime's futex until the next report is due or the run ends. */
+bool LuaEngine::Impl::report_until_done(Runtime& runtime, const LuaRunOptions& run_options,
+                                        ThreadStats** pointers, std::uint32_t threads,
+                                        RunControl* control) {
+    const double percentile = static_cast<double>(run_options.m_percentile);
+    StatsSnapshot previous =
+        aggregate(std::span<ThreadStats* const>(pointers, threads), percentile);
+    auto last_report = Clock::now();
+    const auto interval = std::chrono::seconds(std::max(1u, run_options.m_report_interval));
+    for (;;) {
+        const auto due = last_report + interval;
+        const auto before = Clock::now();
+        const auto left = due > before ? std::chrono::duration_cast<std::chrono::nanoseconds>(due - before)
+                                       : std::chrono::nanoseconds(0);
+        if (runtime.wait_for(left)) return !runtime.stall_detected();
+        const auto now = Clock::now();
+        if (control->m_remaining.load(std::memory_order_acquire) == 0) continue;
+        StatsSnapshot current =
+            aggregate(std::span<ThreadStats* const>(pointers, threads), percentile);
+        StatsSnapshot delta = current.difference(previous, percentile);
+        const double interval_seconds = std::chrono::duration<double>(now - last_report).count();
+        const double total_seconds = std::chrono::duration<double>(now - control->m_start).count();
+        current.m_threads_running = delta.m_threads_running;
+        const bool hooked = m_bootstrap->call_hook("report_intermediate", delta,
+                                                   interval_seconds, total_seconds);
+        if (!hooked) {
+            print_default_intermediate(delta, current, interval_seconds, total_seconds,
+                                       run_options.m_percentile);
+        }
+        previous = current;
+        last_report = now;
+    }
+}
 
 Task<void> LuaEngine::Impl::run_benchmark_worker(const LuaRunOptions& run_options,
                                                     std::uint32_t index,
@@ -2194,8 +2546,18 @@ Task<void> LuaEngine::Impl::run_benchmark_worker(const LuaRunOptions& run_option
                                                     ShardedCounter<std::uint32_t,
                                                                    Runtime::kMaxWorkers>* failures) {
     try {
-        LuaVm vm(Runtime::current_allocator(), *m_options, run_options, m_script_path,
+        Runtime& runtime = *Runtime::current();
+        const int node = runtime.worker_numa_node(Runtime::current_worker_id());
+        mem::HeapArena lua_heap(mem::global_root(),
+                                static_cast<std::size_t>(run_options.m_lua_heap_bytes),
+                                "lua", node);
+        mem::HeapArena session_heap(
+            mem::global_root(),
+            static_cast<std::size_t>(run_options.m_connection_heap_bytes),
+            "connection", node);
+        LuaVm vm(lua_heap, *m_options, run_options, m_script_path,
                  m_command, m_argc, m_argv, index, thread_stats, control);
+        vm.set_session_resource(session_heap);
         mem::String error{mem::Allocator<char>(&vm.resource())};
         if (!vm.load(error)) throw LuaFailure(error);
         if (!vm.install_options(error)) throw LuaFailure("failed to install options");
@@ -2219,6 +2581,7 @@ Task<void> LuaEngine::Impl::run_benchmark_worker(const LuaRunOptions& run_option
         control->m_stop.store(true, std::memory_order_release);
         std::println(stderr, "sysbench: worker {} failed: {}", index, error.what());
     }
+    control->m_remaining.fetch_sub(1, std::memory_order_acq_rel);
     co_return;
 }
 
@@ -2228,8 +2591,18 @@ Task<void> LuaEngine::Impl::run_command_worker(const LuaRunOptions& run_options,
                                                ShardedCounter<std::uint32_t,
                                                               Runtime::kMaxWorkers>* failures) {
     try {
-        LuaVm vm(Runtime::current_allocator(), *m_options, run_options, m_script_path,
+        Runtime& runtime = *Runtime::current();
+        const int node = runtime.worker_numa_node(Runtime::current_worker_id());
+        mem::HeapArena lua_heap(mem::global_root(),
+                                static_cast<std::size_t>(run_options.m_lua_heap_bytes),
+                                "lua", node);
+        mem::HeapArena session_heap(
+            mem::global_root(),
+            static_cast<std::size_t>(run_options.m_connection_heap_bytes),
+            "connection", node);
+        LuaVm vm(lua_heap, *m_options, run_options, m_script_path,
                  m_command, m_argc, m_argv, index, nullptr, nullptr);
+        vm.set_session_resource(session_heap);
         mem::String error{mem::Allocator<char>(&vm.resource())};
         if (!vm.load(error)) throw LuaFailure(error);
         if (!vm.install_options(error)) throw LuaFailure("failed to install options");
@@ -2365,6 +2738,7 @@ int LuaEngine::run(Runtime& runtime, const LuaRunOptions& run_options) {
     control.m_fair_yield = runtime.worker_count() < threads;
 
     ShardedCounter<std::uint32_t, Runtime::kMaxWorkers> failures;
+    control.m_remaining.store(threads, std::memory_order_release);
     for (std::uint32_t i = 0; i < threads; ++i) {
         const std::uint32_t worker = i % std::max(1u, runtime.worker_count());
         runtime.spawn_on(worker, [impl, &run_options, i, pointers, &control,
@@ -2374,37 +2748,13 @@ int LuaEngine::run(Runtime& runtime, const LuaRunOptions& run_options) {
         });
     }
 
-    StatsSnapshot previous = aggregate(std::span<ThreadStats* const>(pointers, threads),
-                                       static_cast<double>(run_options.m_percentile));
-    auto last_report = Clock::now();
-    const auto interval =
-        std::chrono::seconds(std::max(1u, run_options.m_report_interval));
-    if (run_options.m_report_interval == 0) {
-        if (!runtime.wait()) return 1;
-    } else {
-        while (!runtime.wait_for(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(interval))) {
-            const auto now = Clock::now();
-            StatsSnapshot current =
-                aggregate(std::span<ThreadStats* const>(pointers, threads),
-                          static_cast<double>(run_options.m_percentile));
-            StatsSnapshot delta = current.difference(
-                previous, static_cast<double>(run_options.m_percentile));
-            const double interval_seconds =
-                std::chrono::duration<double>(now - last_report).count();
-            const double total_seconds =
-                std::chrono::duration<double>(now - control.m_start).count();
-            current.m_threads_running = delta.m_threads_running;
-            const bool hooked = impl->m_bootstrap->call_hook(
-                "report_intermediate", delta, interval_seconds, total_seconds);
-            if (!hooked) {
-                print_default_intermediate(delta, current, interval_seconds,
-                                           total_seconds, run_options.m_percentile);
-            }
-            previous = current;
-            last_report = now;
-        }
-        if (runtime.stall_detected()) return 1;
+    /* The calling thread is the console thread: it prints the interval
+    reports (if configured) and the final report, and otherwise sleeps.  The
+    workers detect stalls and wake it when the last task ends. */
+    if (run_options.m_report_interval != 0) {
+        if (!impl->report_until_done(runtime, run_options, pointers, threads, &control)) return 1;
+    } else if (!runtime.wait()) {
+        return 1;
     }
 
     const auto now = Clock::now();
@@ -2419,6 +2769,7 @@ int LuaEngine::run(Runtime& runtime, const LuaRunOptions& run_options) {
         print_default_final_report(final_snapshot, total_seconds,
                                    run_options.m_percentile);
     }
+    sb::layer::report();
     if (run_options.m_histogram) print_histogram(final_snapshot);
 
     for (std::uint32_t i = 0; i < threads; ++i) stats[i].~ThreadStats();

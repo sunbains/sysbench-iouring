@@ -15,6 +15,7 @@
 // Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
 #include <print>
+#include "sysbench/layer_stats.hpp"
 #include "sysbench/memory.hpp"
 #include "sysbench/numa.hpp"
 
@@ -596,7 +597,27 @@ struct FrameSlab {
 };
 
 thread_local int tls_frame_node = 0;
-constexpr std::size_t kFrameCachePerClass = 8;
+
+// The coroutine frame allocator.  Coroutines are pinned to the worker that
+// created them, so a frame is almost always freed on the thread that allocated
+// it.  Each thread keeps its own per-class free lists: allocation and free are
+// a pointer pop and push with no atomics and no shared cache line.  A frame
+// carries its owner's token; one freed on another thread (rare) goes to the
+// per-node shared stack, from which an owner refills only when its own list
+// and slab are both exhausted.
+std::atomic<std::uint32_t> g_next_frame_owner{1};
+thread_local std::uint32_t tls_frame_owner = 0;
+
+std::uint32_t frame_owner() noexcept {
+    if (tls_frame_owner == 0)
+        tls_frame_owner = g_next_frame_owner.fetch_add(1, std::memory_order_relaxed);
+    return tls_frame_owner;
+}
+// Frames are recycled on the thread that frees them.  A query creates and
+// destroys several frames of one class per resume (destruction is deferred until
+// the resume unwinds), so a small cache overflowed into the per-node shared
+// stack on every query and every worker of the node fought over its head.
+constexpr std::size_t kFrameCachePerClass = 1024;
 thread_local FrameHeader* tls_frame_cache[kFrameClasses]{};
 thread_local std::uint16_t tls_frame_cache_count[kFrameClasses]{};
 thread_local std::array<FrameSlab, numa::kMaxNodes> tls_frame_slabs{};
@@ -687,41 +708,35 @@ void set_thread_frame_node(int node) noexcept {
 }
 
 void* allocate_task_frame(std::size_t size) {
+    SB_LAYER(Memory);
     const int node = tls_frame_node;
     const std::size_t index = frame_class(size);
+    const std::uint32_t owner = frame_owner();
+
+    if (FrameHeader* header = tls_frame_cache[index]; header != nullptr) [[likely]] {
+        tls_frame_cache[index] = header->m_next;
+        header->m_next = nullptr;
+        header->m_magic = kFrameAlive;
+        header->m_reserved = owner;
+        return reinterpret_cast<std::byte*>(header) + kFrameReserve;
+    }
+
     const std::size_t capacity = frame_capacity(index);
     const std::size_t need = (capacity + kFrameReserve + 63) & ~std::size_t(63);
-
-    if (tls_frame_cache[index] != nullptr) {
-        FrameHeader* header = tls_frame_cache[index];
-        tls_frame_cache[index] = header->m_next;
-        --tls_frame_cache_count[index];
-        header->m_next = nullptr;
-        header->m_magic = kFrameAlive;
-        return reinterpret_cast<std::byte*>(header) + kFrameReserve;
-    }
-
-    FrameStack& stack = frame_stack_for(node, index);
-    for (std::size_t i = 0; i < kFrameCachePerClass; ++i) {
-        FrameHeader* header = pop_frame(stack);
-        if (header == nullptr) break;
-        header->m_next = tls_frame_cache[index];
-        tls_frame_cache[index] = header;
-        ++tls_frame_cache_count[index];
-    }
-    if (tls_frame_cache[index] != nullptr) {
-        FrameHeader* header = tls_frame_cache[index];
-        tls_frame_cache[index] = header->m_next;
-        --tls_frame_cache_count[index];
-        header->m_next = nullptr;
-        header->m_magic = kFrameAlive;
-        return reinterpret_cast<std::byte*>(header) + kFrameReserve;
-    }
-
     const std::size_t safe_node =
         node >= 0 && static_cast<std::uint32_t>(node) < numa::kMaxNodes
             ? static_cast<std::size_t>(node)
             : 0;
+
+    /* Frames another thread gave back for this node and class. */
+    if (FrameHeader* header = pop_frame(frame_stack_for(node, index));
+        header != nullptr) {
+        header->m_next = nullptr;
+        header->m_magic = kFrameAlive;
+        header->m_reserved = owner;
+        return reinterpret_cast<std::byte*>(header) + kFrameReserve;
+    }
+
     FrameSlab& slab = tls_frame_slabs[safe_node];
     if (slab.m_base == nullptr || slab.m_used + need > slab.m_capacity) {
         const std::size_t slab_size = align_up(std::max(kFrameSlabSize, need), 4096);
@@ -739,12 +754,13 @@ void* allocate_task_frame(std::size_t size) {
     header->m_class_index = static_cast<std::uint32_t>(index);
     header->m_node = static_cast<std::uint32_t>(safe_node);
     header->m_magic = kFrameAlive;
-    header->m_reserved = 0;
+    header->m_reserved = owner;
     header->m_next = nullptr;
     return reinterpret_cast<std::byte*>(header) + kFrameReserve;
 }
 
 void deallocate_task_frame(void* pointer, std::size_t) noexcept {
+    SB_LAYER(Memory);
     if (pointer == nullptr) return;
     auto* header = reinterpret_cast<FrameHeader*>(
         static_cast<std::byte*>(pointer) - kFrameReserve);
@@ -756,11 +772,10 @@ void deallocate_task_frame(void* pointer, std::size_t) noexcept {
     header->m_magic = kFrameFree;
     const std::size_t index = header->m_class_index;
     if (index >= kFrameClasses) return;
-    if (static_cast<int>(header->m_node) == tls_frame_node &&
-        tls_frame_cache_count[index] < kFrameCachePerClass) {
+    if (header->m_reserved == tls_frame_owner &&
+        static_cast<int>(header->m_node) == tls_frame_node) [[likely]] {
         header->m_next = tls_frame_cache[index];
         tls_frame_cache[index] = header;
-        ++tls_frame_cache_count[index];
         return;
     }
     FrameStack& stack = frame_stack_for(static_cast<int>(header->m_node), index);

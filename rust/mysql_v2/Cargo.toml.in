@@ -1,0 +1,15 @@
+[package]
+name = "sysbench-mysql-v2"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "sysbench_mysql_v2"
+path = "@CMAKE_CURRENT_SOURCE_DIR@/rust/mysql_v2/src/lib.rs"
+crate-type = ["staticlib"]
+
+[dependencies]
+mysql-client-lib = { path = "@SYSBENCH_MYSQL_CLIENT_LIB_DIR@", default-features = false, features = ["tls"] }
+
+[workspace]

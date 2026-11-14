@@ -64,6 +64,7 @@ statistics and output formats.
 - `libnuma` development files
 - Lua 5.4 development files
 - OpenSSL development files (caching_sha2 RSA auth and TLS)
+- Cargo/Rust for the optional sql-rust protocol revision 2 client
 
 Ubuntu:
 
@@ -79,6 +80,19 @@ cmake --build build -j
 ```
 
 Optional: `-DSYSBENCH_NATIVE=ON`, `-DSYSBENCH_WERROR=ON`.
+
+Protocol revision 2 uses the Rust library from a sibling `mysql-client-lib`
+checkout and is enabled automatically when that checkout exists. To select
+another location or explicitly enable it:
+
+```sh
+cmake -S . -B build -DSYSBENCH_MYSQL_V2=ON \
+  -DSYSBENCH_MYSQL_CLIENT_LIB_DIR="$HOME/dev/mysql-client-lib"
+cmake --build build -j
+```
+
+`-DSYSBENCH_MYSQL_V2=OFF` builds without Rust. Cargo artifacts and compiler
+scratch files for the bridge are kept under the build directory.
 
 ## Test
 
@@ -144,11 +158,66 @@ All reference OLTP variants are included: `oltp_point_select`,
 `oltp_delete`, `oltp_update_index`, `oltp_update_non_index`,
 `select_random_points`, `select_random_ranges`, `bulk_insert`.
 
+The `mysql_handler` module exercises MySQL's
+[SQL HANDLER interface](https://dev.mysql.com/doc/refman/8.4/en/handler.html).
+It uses the same OLTP tables and connection options:
+
+```sh
+./build/sysbench26 mysql_handler --mysql-db=sbtest --tables=4 --table-size=10000 prepare
+./build/sysbench26 mysql_handler --mysql-db=sbtest --tables=4 --table-size=10000 \
+  --handler-mode=point --handler-reads=1 --threads=8 --time=60 run
+./build/sysbench26 mysql_handler --mysql-db=sbtest --tables=4 cleanup
+```
+
+`--handler-mode=point` (default) reads random IDs through the primary key;
+`range` reads from a random ID with `--range-size` rows per command;
+`scan` issues `READ FIRST`, then `READ NEXT` for subsequent commands in the
+event. `--handler-reads` sets commands per event (default 1). Scans restart
+each event and may return empty results after reaching the end of a table.
+`--secondary=on` uses the OLTP `xid` index for point/range reads.
+Each worker opens its own handlers, closes them on completion, and reopens
+them after `--reconnect=N` events. Use a storage engine that supports HANDLER,
+such as InnoDB or MyISAM. HANDLER returns all columns and does not provide
+the same consistency guarantees as SELECT.
+
 Script `help`:
 
 ```sh
 ./build/sysbench26 oltp_read_write --help
 ./build/sysbench26 oltp_read_write help
+```
+
+For a sql-rust server, `--mysql-protocol=2` selects the Rust client and sends
+the connection attribute `sqlrust_protocol=2` on every connection, including
+reconnects. This enables the server's PostgreSQL-style `INSERT ... RETURNING`
+extension; it is a sql-rust revision of the MySQL protocol. Standard MySQL
+servers do not implement this SQL extension. The default revision 1 uses the
+existing C++ client.
+
+```sh
+./build/sysbench26 oltp_insert_returning --mysql-protocol=2 --mysql-db=sbtest prepare
+./build/sysbench26 oltp_insert_returning --mysql-protocol=2 --mysql-db=sbtest \
+  --threads=4 --time=10 run
+./build/sysbench26 oltp_insert_returning --mysql-protocol=2 --mysql-db=sbtest cleanup
+```
+
+Both `con:query()` and prepared `stmt:execute()` expose returned rows through
+`fetch_row()` alongside `affected_rows`, `last_insert_id`, `warnings`, and
+`status`. The Rust adapter retains the statement counts from the final OK
+packet and drains additional results before the next command. Its Rust
+allocations use the project's arena hierarchy, and socket I/O still uses the
+runtime's registered io_uring buffers. Each connection also reserves a 256 KiB
+stack to adapt the Rust client's synchronous transport callbacks to coroutines.
+The Rust library supports TLS 1.2/1.3 with `--mysql-ssl=preferred|required`,
+optional CA/hostname verification, and client certificates using the existing
+`--mysql-ssl-*` options. `caching_sha2_password` full authentication is supported
+over TLS. Preferred mode falls back only when the server does not advertise
+TLS; certificate or TLS handshake failures return errors.
+
+```sh
+./build/sysbench26 oltp_insert_returning --mysql-protocol=2 --mysql-db=sbtest \
+  --mysql-ssl=required --mysql-ssl-verify-server-cert=on \
+  --mysql-ssl-ca=/path/to/ca.pem run
 ```
 
 ## Important options
@@ -167,6 +236,7 @@ Script `help`:
 | `--populate-memory` | Fault in/resident the root reservation up front |
 | `--db-driver=mysql` | Only `mysql` is registered in this build |
 | `--mysql-host/port/user/password/db/socket` | Connection options |
+| `--mysql-protocol=1/2` | C++ MySQL client (default 1), or Rust sql-rust revision 2 client |
 | `--mysql-ssl=off/preferred/required` | MySQL TLS mode (default off) |
 | `--mysql-ssl-verify-server-cert` | Verify CA and hostname/IP |
 | `--mysql-ssl-ca`, `--mysql-ssl-cert`, `--mysql-ssl-key` | TLS trust/client identity files |

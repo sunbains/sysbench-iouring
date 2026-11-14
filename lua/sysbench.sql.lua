@@ -36,6 +36,23 @@ local driver_mt = { __index = driver_methods }
 local connection_mt = { __index = connection_methods }
 local statement_mt = { __index = statement_methods }
 local result_mt = { __index = result_methods }
+
+-- A connection has one current result (as in stock sysbench), valid until its
+-- next query: the result table is created once and refilled per query, so a
+-- query allocates nothing.
+local function current_result(connection, ud)
+   local rs = connection.__rs
+   if rs == nil then
+      rs = setmetatable({__ud = ud}, result_mt)
+      connection.__rs = rs
+   end
+   rs.__ud = ud
+   rs.nrows, rs.nfields, rs.affected_rows, rs.last_insert_id, rs.warnings,
+      rs.status = sb_sql_result_info(ud)
+   rs.row_index = 0
+   rs.freed = false
+   return rs
+end
 local param_mt = { __index = param_methods }
 
 function sysbench.sql.driver(driver_name)
@@ -113,9 +130,33 @@ function connection_methods.query(self, query)
    if ud == nil then
       return self:check_error(nil, query)
    end
-   local nrows, nfields = sb_sql_result_info(ud)
-   return setmetatable({__ud = ud, nrows = nrows, nfields = nfields,
-                        row_index = 0, freed = false}, result_mt)
+   return current_result(self, ud)
+end
+
+-- Run `total` copies of query keeping up to `depth` of them in flight on this
+-- connection (a steady stream); results are discarded.
+function connection_methods.query_stream(self, query, depth, total)
+   if not sb_sql_query_stream(self.__ud, query, depth, total) then
+      return self:check_error(nil, query)
+   end
+   return true
+end
+
+-- Pipelining: with depth > 1, query() and execute() write the command and
+-- return at once with an empty result; a reply is read (and discarded) only
+-- when `depth` commands are outstanding.  Any other call on the connection
+-- reads the outstanding replies first.  An error reply surfaces on the call
+-- that reads it.  depth 0 or 1 turns pipelining off.
+function connection_methods.pipeline(self, depth)
+   return sb_sql_pipeline(self.__ud, depth)
+end
+
+-- Read every outstanding pipelined reply.
+function connection_methods.flush(self)
+   if not sb_sql_flush(self.__ud) then
+      return self:check_error(nil, "<pipeline flush>")
+   end
+   return true
 end
 
 function connection_methods.more_results(self)
@@ -178,7 +219,7 @@ function statement_methods.bind_param(self, ...)
    for i = 1, count do
       parameters[i] = parameters[i].__ud
    end
-   return sb_sql_bind_param(self.__ud, table.unpack(parameters, 1, count))
+   return sb_sql_bind_param(self.__ud, unpack(parameters, 1, count))
 end
 
 function statement_methods.execute(self)
@@ -186,9 +227,7 @@ function statement_methods.execute(self)
    if ud == nil then
       return self.connection:check_error(nil, "<prepared statement>")
    end
-   local nrows, nfields = sb_sql_result_info(ud)
-   return setmetatable({__ud = ud, nrows = nrows, nfields = nfields,
-                        row_index = 0, freed = false}, result_mt)
+   return current_result(self.connection, ud)
 end
 
 function statement_methods.next_result(self)

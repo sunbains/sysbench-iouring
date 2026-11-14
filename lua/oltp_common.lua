@@ -71,6 +71,10 @@ sysbench.cmdline.options = {
    reconnect =
       {"Reconnect after every N events. The default (0) is to not reconnect",
        0},
+   stream_depth =
+      {"Queries in flight per connection (pipelining): each query is " ..
+          "written without waiting for the previous reply, which is read " ..
+          "once this many are outstanding. 1 waits for every reply", 1},
    mysql_storage_engine =
       {"Storage engine, if MySQL is used", "innodb"},
    pgsql_variant =
@@ -368,6 +372,15 @@ function thread_init()
 
    -- This function is a 'callback' defined by individual benchmark scripts
    prepare_statements()
+
+   enable_streaming(con)
+end
+
+-- Keep --stream-depth queries in flight on the connection (a steady stream).
+function enable_streaming(connection)
+   if sysbench.opt.stream_depth > 1 then
+      connection:pipeline(sysbench.opt.stream_depth)
+   end
 end
 
 -- Close prepared statements
@@ -386,6 +399,7 @@ function close_statements()
 end
 
 function thread_done()
+   con:flush()
    close_statements()
    con:disconnect()
 end

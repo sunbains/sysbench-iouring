@@ -38,6 +38,13 @@ TEST("query classification") {
     CHECK(classify_query("COMMIT") == QueryKind::Transaction);
     CHECK(classify_query("DROP TABLE t") == QueryKind::Write);
     CHECK(classify_query("CALL p()") == QueryKind::Other);
+    CHECK(classify_query("HANDLER sbtest1 READ `PRIMARY` = (1)") == QueryKind::Read);
+    CHECK(classify_query("/* c */ handler\t`test`.`a READ ``b` read FIRST") == QueryKind::Read);
+    CHECK(classify_query("HANDLER sbtest1 READ NEXT LIMIT 10") == QueryKind::Read);
+    CHECK(classify_query("HANDLER sbtest1 OPEN") == QueryKind::Other);
+    CHECK(classify_query("HANDLER `a READ b` CLOSE") == QueryKind::Other);
+    CHECK(classify_query("HANDLER sbtest1") == QueryKind::Other);
+    CHECK(classify_query("HANDLER sbtest1 READER") == QueryKind::Other);
 }
 
 

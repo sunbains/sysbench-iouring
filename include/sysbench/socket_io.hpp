@@ -16,19 +16,17 @@
 
 #pragma once
 
-// One io_uring per socket with three roles:
-//   * the owning runtime worker is the sole SQ submitter and drains a lock-free
-//     power-of-two request ring (io_uring does not permit shared SQ submit);
-//   * a dedicated reaper thread waits for CQEs and posts suspended coroutines
-//     back to the runtime worker.
-// No mutex, rwlock or condition variable guards the ring.
+// Socket I/O on the owning worker's io_uring.  A connection lives on one
+// worker; its awaiters prepare SQEs directly in that worker's ring, and the
+// worker submits them in a batch, reaps the CQEs and resumes the coroutines.
+// No queue, no other thread, no wakeup.
 
 #include "sysbench/io_ring.hpp"
-#include "sysbench/lockfree_queue.hpp"
 #include "sysbench/runtime.hpp"
 
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <cstdint>
 #include <sys/socket.h>
 
@@ -40,8 +38,12 @@ enum class IoOperation : std::uint8_t {
     Connect,
     Accept,
     Recv,
-    Send
+    Send,
+    SendPosted,
+    Nop
 };
+
+class SocketIo;
 
 struct IoRequest {
     IoOperation m_operation = IoOperation::ReadFixed;
@@ -57,57 +59,103 @@ struct IoRequest {
     IoCompletion m_completion{};
 };
 
-class SocketIo : public IoReaper {
+class SocketIo {
 public:
     SocketIo(Runtime& runtime, std::uint32_t worker_id,
-             unsigned entries = 256, unsigned buffer_slots = 2,
-             unsigned buffer_size = 16 * 1024);
+             unsigned buffer_slots = 2, unsigned buffer_size = 16 * 1024);
     ~SocketIo();
 
     SocketIo(const SocketIo&) = delete;
     SocketIo& operator=(const SocketIo&) = delete;
 
-    // Enqueue from the owning runtime worker and submit everything queued.
-    // The request lives in the awaiting coroutine frame until completion.
+    // Owning worker only.  Prepare the request's SQE in the worker's ring; the
+    // request lives in the awaiting coroutine frame until it is reaped.  A
+    // receive that directly follows a posted send on the same socket is linked
+    // to it, so it is issued only once the send is done.
     [[nodiscard]] bool enqueue(IoRequest& request) noexcept;
 
-    // IoReaper: the Runtime scheduler drives reaping and waiting.
-    [[nodiscard]] bool running() const noexcept override {
-        return m_running.load(std::memory_order_acquire);
-    }
-    bool reap() noexcept override;
-    bool wait() noexcept override;
-    void pin() noexcept override;
-    void request_stop() noexcept override;
-    [[nodiscard]] Runtime& runtime() noexcept override { return *m_runtime; }
+    // ---- Posted sends ------------------------------------------------------
+    // Commands are framed into the send buffer, used as a ring, and sent
+    // without being awaited; several can be in flight (pipelining).  A region
+    // is reused once its send's CQE has been reaped.  Consecutive sends on
+    // one socket in one submission are linked, so they go out in order; the
+    // receive for the reply is linked behind the last one.  Nothing here
+    // waits: when the next send cannot be staged yet, the caller awaits the
+    // blocking send's completion (PostedSendAwaiter), which hands control to
+    // the worker's scheduler.
 
-    [[nodiscard]] IoRing& ring() noexcept { return m_ring; }
+    // The buffer posted sends are framed in (the connection's write buffer).
+    void set_send_buffer(std::byte* base, std::size_t size) noexcept;
+    // Space for an `length`-byte send, or nullptr and the send that must
+    // complete first (the ring is full, or the socket's previous send was
+    // submitted in an earlier batch and is still in flight: issuing another
+    // now could reorder the two on the wire).
+    [[nodiscard]] std::byte* stage_send(std::size_t length, IoCompletion*& blocker);
+    // Post the staged bytes [buffer, buffer + length) on `fd`.  False if the
+    // ring has no SQE (the caller falls back to an awaited send).
+    [[nodiscard]] bool post_send(int fd, std::byte* buffer, unsigned length);
+    // The oldest send still in flight (nullptr if none): await it to drain.
+    [[nodiscard]] IoCompletion* oldest_posted() noexcept;
+    // A completed posted send's failure (negative errno), consumed; 0 if none.
+    [[nodiscard]] int take_post_failure() noexcept;
+    // Forget every posted send without waiting (connection closed): sends in
+    // flight are orphaned to the worker, which takes them back when reaped.
+    void abandon_posted() noexcept;
+
     [[nodiscard]] RegisteredBufferPool& buffers() noexcept { return m_buffers; }
     [[nodiscard]] int numa_node() const noexcept { return m_numa_node; }
     [[nodiscard]] std::uint32_t worker_id() const noexcept { return m_worker_id; }
 
 private:
-    static constexpr std::size_t kSubmitRingCapacity = 512;
-
-    void submit_pending() noexcept;
+    static constexpr unsigned kMaxPosted = 64;
+    struct Posted {
+        IoCompletion* m_completion = nullptr;
+        std::uint32_t m_offset = 0;
+        std::uint32_t m_length = 0;
+        std::uint64_t m_epoch = 0;
+    };
+    // Release the regions of reaped sends, oldest first.
+    void retire_posted() noexcept;
 
     int m_numa_node = -1;
-    IoRing m_ring;
     RegisteredBufferPool m_buffers;
-    Runtime* m_runtime = nullptr;
     std::uint32_t m_worker_id = 0;
-    std::atomic<bool> m_running{true};
-    LockFreeQueue<IoRequest*, kSubmitRingCapacity> m_submit_ring;
-    // The reaper sleeps in poll() on the ring's CQ eventfd instead of blocking
-    // in io_uring_enter(), so shutdown can wake it immediately instead of
-    // waiting out a timeout.
-    int m_cq_fd = -1;
-    int m_shutdown_fd = -1;
-    bool m_cq_eventfd_registered = false;
+    IoRing* m_ring = nullptr;
+    bool m_running = true;
+    std::byte* m_send_base = nullptr;
+    std::uint32_t m_send_size = 0;
+    // Next free byte of the send ring.
+    std::uint32_t m_send_head = 0;
+    std::array<Posted, kMaxPosted> m_posted{};
+    unsigned m_posted_first = 0;
+    unsigned m_posted_count = 0;
+    int m_post_failure = 0;
+    // The most recent posted send's socket and SQE (for linking).
+    int m_post_fd = -1;
+    io_uring_sqe* m_post_sqe = nullptr;
 };
 
-// Awaiters.  They only enqueue; the request body is embedded in the coroutine
-// frame and is not touched by another thread until the submitter picks it up.
+// Await a posted send's completion: the task is parked on the CQE and the
+// worker runs other tasks meanwhile.
+class PostedSendAwaiter {
+public:
+    explicit PostedSendAwaiter(IoCompletion* completion) noexcept : m_completion(completion) {}
+    [[nodiscard]] bool await_ready() const noexcept {
+        return m_completion == nullptr || m_completion->m_done;
+    }
+    void await_suspend(std::coroutine_handle<>) noexcept {
+        m_completion->m_task = detail::tls_current;
+    }
+    void await_resume() const noexcept {
+        if (m_completion != nullptr) m_completion->m_task = nullptr;
+    }
+
+private:
+    IoCompletion* m_completion;
+};
+
+// Awaiters.  They only prepare an SQE; the request body is embedded in the
+// coroutine frame and only the owning worker touches it.
 class SocketReadAwaiter {
 public:
     SocketReadAwaiter(SocketIo& io, int fd, void* buffer, unsigned length,

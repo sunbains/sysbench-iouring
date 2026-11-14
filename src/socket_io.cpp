@@ -16,35 +16,12 @@
 
 #include "sysbench/socket_io.hpp"
 
-#include <pthread.h>
-#include <sched.h>
-
 #include <cerrno>
-#include <poll.h>
-#include <sys/eventfd.h>
-#include <unistd.h>
 
-#include "sysbench/numa.hpp"
+#include "sysbench/layer_stats.hpp"
 
 namespace sb {
 namespace {
-
-constexpr std::size_t kSubmitBatch = 64;
-
-void pin_to_node(int node) noexcept {
-    if (node < 0) return;
-    (void)numa::set_preferred(node);
-    const numa::Topology& topology = numa::Topology::instance();
-    const numa::NodeInfo* info = topology.node_by_id(node);
-    if (info == nullptr) return;
-    cpu_set_t set;
-    CPU_ZERO(&set);
-    for (std::uint32_t i = 0; i < info->m_cpu_count; ++i) {
-        const int cpu = static_cast<int>(info->m_cpus[i]);
-        if (cpu != topology.reserved_cpu()) CPU_SET(cpu, &set);
-    }
-    (void)::pthread_setaffinity_np(::pthread_self(), sizeof(set), &set);
-}
 
 bool enqueue_awaiter(SocketIo& io, IoRequest& request) noexcept {
     request.m_completion.m_task = detail::tls_current;
@@ -57,186 +34,213 @@ bool enqueue_awaiter(SocketIo& io, IoRequest& request) noexcept {
     return true;
 }
 
+[[nodiscard]] WaitKind wait_kind(IoOperation operation) noexcept {
+    switch (operation) {
+        case IoOperation::ReadFixed:
+        case IoOperation::Recv: return WaitKind::Reply;
+        case IoOperation::Connect:
+        case IoOperation::Accept: return WaitKind::Connect;
+        default: return WaitKind::Send;
+    }
+}
+
+[[nodiscard]] bool prepare(IoRing& ring, IoRequest& item) noexcept {
+    IoCompletion* completion = &item.m_completion;
+    completion->m_kind = wait_kind(item.m_operation);
+    switch (item.m_operation) {
+        case IoOperation::ReadFixed:
+        case IoOperation::Recv:
+            return ring.submit_recv(item.m_fd, item.m_buffer, item.m_length,
+                                    item.m_operation == IoOperation::Recv ? item.m_flags : 0,
+                                    completion);
+        case IoOperation::WriteFixed:
+        case IoOperation::Send:
+            return ring.submit_send(item.m_fd, item.m_const_buffer, item.m_length,
+                                    (item.m_operation == IoOperation::Send ? item.m_flags : 0) |
+                                        MSG_NOSIGNAL,
+                                    completion);
+        case IoOperation::SendPosted:
+            return ring.submit_send_posted(item.m_fd, item.m_const_buffer, item.m_length,
+                                           completion);
+        case IoOperation::Connect:
+            return ring.submit_connect(item.m_fd, item.m_address, item.m_address_length,
+                                       completion);
+        case IoOperation::Accept:
+            return ring.submit_accept(item.m_fd, const_cast<sockaddr*>(item.m_address),
+                                      item.m_result_length, completion);
+        case IoOperation::Nop:
+            return ring.submit_nop(completion);
+    }
+    return false;
+}
+
 }  // namespace
 
-SocketIo::SocketIo(Runtime& runtime, std::uint32_t worker_id, unsigned entries,
+SocketIo::SocketIo(Runtime& runtime, std::uint32_t worker_id,
                    unsigned buffer_slots, unsigned buffer_size)
     : m_numa_node(runtime.worker_numa_node(worker_id)),
-      m_ring(entries),
-      m_buffers(m_ring, mem::global_root(), buffer_size, buffer_slots,
-               m_numa_node),
-      m_runtime(&runtime),
-      m_worker_id(worker_id) {
-    m_cq_fd = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-    if (m_cq_fd >= 0) {
-        m_cq_eventfd_registered =
-            io_uring_register_eventfd(&m_ring.native_ring(), m_cq_fd) == 0;
-        if (!m_cq_eventfd_registered) {
-            ::close(m_cq_fd);
-            m_cq_fd = -1;
-        }
-    }
-    m_shutdown_fd = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-    if (m_shutdown_fd < 0) {
-        if (m_cq_eventfd_registered) {
-            (void)io_uring_unregister_eventfd(&m_ring.native_ring());
-            m_cq_eventfd_registered = false;
-        }
-        if (m_cq_fd >= 0) {
-            ::close(m_cq_fd);
-            m_cq_fd = -1;
-        }
-        throw std::system_error(errno, std::generic_category(), "eventfd");
-    }
-    if (!runtime.start_reaper(*this)) {
-        if (m_cq_eventfd_registered) {
-            (void)io_uring_unregister_eventfd(&m_ring.native_ring());
-            m_cq_eventfd_registered = false;
-        }
-        if (m_cq_fd >= 0) ::close(m_cq_fd);
-        if (m_shutdown_fd >= 0) ::close(m_shutdown_fd);
-        throw std::runtime_error("runtime reaper registry is full");
-    }
+      m_buffers(mem::global_root(), buffer_size, buffer_slots, m_numa_node),
+      m_worker_id(worker_id),
+      m_ring(Runtime::current_ring()) {
+    if (m_ring == nullptr) detail::no_runtime();
 }
 
 SocketIo::~SocketIo() {
-    request_stop();
-    m_runtime->stop_reaper(*this);
-    if (m_cq_eventfd_registered) {
-        (void)io_uring_unregister_eventfd(&m_ring.native_ring());
-        m_cq_eventfd_registered = false;
+    /* Sends in flight complete into worker-owned records: orphan them, no
+    waiting.  (Once the worker has gone, its ring and records have gone too.) */
+    if (Runtime::current_ring() == m_ring) abandon_posted();
+    m_running = false;
+}
+
+void SocketIo::set_send_buffer(std::byte* base, std::size_t size) noexcept {
+    m_send_base = base;
+    m_send_size = static_cast<std::uint32_t>(size);
+    m_send_head = 0;
+}
+
+void SocketIo::retire_posted() noexcept {
+    while (m_posted_count != 0) {
+        Posted& oldest = m_posted[m_posted_first];
+        if (!oldest.m_completion->m_done) break;
+        const int result = oldest.m_completion->m_result;
+        if (m_post_failure == 0) {
+            if (result < 0) {
+                m_post_failure = result;
+            } else if (static_cast<std::uint32_t>(result) != oldest.m_length) {
+                m_post_failure = -EIO;
+            }
+        }
+        Runtime::release_send_completion(oldest.m_completion);
+        oldest.m_completion = nullptr;
+        m_posted_first = (m_posted_first + 1) % kMaxPosted;
+        --m_posted_count;
     }
-    if (m_cq_fd >= 0) {
-        ::close(m_cq_fd);
-        m_cq_fd = -1;
-    }
-    if (m_shutdown_fd >= 0) {
-        ::close(m_shutdown_fd);
-        m_shutdown_fd = -1;
+    if (m_posted_count == 0) {
+        m_send_head = 0;
+        m_post_fd = -1;
+        m_post_sqe = nullptr;
     }
 }
 
-bool SocketIo::enqueue(IoRequest& request) noexcept {
-    if (!m_running.load(std::memory_order_acquire) ||
-        Runtime::current_worker_id() != m_worker_id) {
+std::byte* SocketIo::stage_send(std::size_t length, IoCompletion*& blocker) {
+    SB_LAYER(IoPrep);
+    blocker = nullptr;
+    retire_posted();
+    if (m_posted_count == 0) {
+        return length <= m_send_size ? m_send_base : nullptr;
+    }
+    Posted& newest = m_posted[(m_posted_first + m_posted_count - 1) % kMaxPosted];
+    Posted& oldest = m_posted[m_posted_first];
+    /* The previous send went out in an earlier submission and is still in
+    flight (the socket was full, so it is waiting for room): a new one could
+    overtake it. */
+    if (!newest.m_completion->m_done && newest.m_epoch != m_ring->submit_epoch()) {
+        blocker = newest.m_completion;
+        return nullptr;
+    }
+    if (m_posted_count == kMaxPosted || length > m_send_size) {
+        blocker = oldest.m_completion;
+        return nullptr;
+    }
+    /* Live bytes run from the oldest region to the head, possibly wrapped. */
+    const std::uint32_t tail = oldest.m_offset;
+    const auto need = static_cast<std::uint32_t>(length);
+    if (m_send_head >= tail) {
+        if (m_send_head + need <= m_send_size) return m_send_base + m_send_head;
+        if (need <= tail) return m_send_base;  // wrap
+    } else if (m_send_head + need <= tail) {
+        return m_send_base + m_send_head;
+    }
+    blocker = oldest.m_completion;
+    return nullptr;
+}
+
+bool SocketIo::post_send(int fd, std::byte* buffer, unsigned length) {
+    SB_LAYER(IoPrep);
+    if (!m_running) return false;
+    IoCompletion* completion = Runtime::acquire_send_completion();
+    /* Keep a socket's sends in order: chain this one behind its previous
+    send when that is still the last SQE of this submission. */
+    if (m_post_fd == fd && m_post_sqe != nullptr && m_ring->last_sqe() == m_post_sqe &&
+        m_posted_count != 0 &&
+        m_posted[(m_posted_first + m_posted_count - 1) % kMaxPosted].m_epoch ==
+            m_ring->submit_epoch()) {
+        m_ring->link_last();
+    }
+    if (!m_ring->submit_send_posted(fd, buffer, length, completion)) {
+        Runtime::release_send_completion(completion);
         return false;
     }
-    // The owning worker is the only producer and it drains the ring into the
-    // SQ on every enqueue, so a full ring means the submission path failed.
-    // Never wait for space here; all waiting policy belongs to the Runtime.
-    if (!m_submit_ring.try_push(&request)) return false;
-    Runtime::note_io_submitted();
-    submit_pending();
+    Runtime::io_issued(completion);
+    const auto offset = static_cast<std::uint32_t>(buffer - m_send_base);
+    m_posted[(m_posted_first + m_posted_count) % kMaxPosted] =
+        Posted{completion, offset, length, m_ring->submit_epoch()};
+    ++m_posted_count;
+    m_send_head = offset + length;
+    m_post_fd = fd;
+    m_post_sqe = m_ring->last_sqe();
     return true;
 }
 
-void SocketIo::submit_pending() noexcept {
-    IoRequest* batch[kSubmitBatch];
-    std::size_t count = 0;
-    IoRequest* request = nullptr;
-    while (count < kSubmitBatch && m_submit_ring.try_pop(request)) {
-        batch[count++] = request;
-    }
-    if (count == 0) return;
+IoCompletion* SocketIo::oldest_posted() noexcept {
+    retire_posted();
+    return m_posted_count == 0 ? nullptr : m_posted[m_posted_first].m_completion;
+}
 
-    bool submitted = false;
-    for (std::size_t i = 0; i < count; ++i) {
-        IoRequest* item = batch[i];
-        bool ok = false;
-        switch (item->m_operation) {
-            case IoOperation::ReadFixed:
-                ok = m_ring.submit_read_fixed(item->m_fd, item->m_buffer, item->m_length,
-                                             item->m_slot, &item->m_completion);
-                break;
-            case IoOperation::WriteFixed:
-                ok = m_ring.submit_write_fixed(item->m_fd, item->m_const_buffer,
-                                              item->m_length, item->m_slot,
-                                              &item->m_completion);
-                break;
-            case IoOperation::Connect:
-                ok = m_ring.submit_connect(item->m_fd, item->m_address,
-                                          item->m_address_length, &item->m_completion);
-                break;
-            case IoOperation::Accept:
-                ok = m_ring.submit_accept(item->m_fd, const_cast<sockaddr*>(item->m_address),
-                                         item->m_result_length, &item->m_completion);
-                break;
-            case IoOperation::Recv:
-                ok = m_ring.submit_recv(item->m_fd, item->m_buffer, item->m_length,
-                                       item->m_flags, &item->m_completion);
-                break;
-            case IoOperation::Send:
-                ok = m_ring.submit_send(item->m_fd, item->m_const_buffer, item->m_length,
-                                       item->m_flags, &item->m_completion);
-                break;
-        }
-        if (!ok) {
-            m_runtime->post_completion(m_worker_id, item->m_completion.m_task);
-            m_runtime->note_io_completed(m_worker_id);
+int SocketIo::take_post_failure() noexcept {
+    retire_posted();
+    const int failure = m_post_failure;
+    m_post_failure = 0;
+    return failure;
+}
+
+void SocketIo::abandon_posted() noexcept {
+    while (m_posted_count != 0) {
+        Posted& oldest = m_posted[m_posted_first];
+        if (oldest.m_completion->m_done) {
+            Runtime::release_send_completion(oldest.m_completion);
         } else {
-            submitted = true;
+            oldest.m_completion->m_task = nullptr;
+            oldest.m_completion->m_orphan = true;
         }
+        oldest.m_completion = nullptr;
+        m_posted_first = (m_posted_first + 1) % kMaxPosted;
+        --m_posted_count;
     }
-    if (submitted) (void)m_ring.flush_submit();
+    m_posted_first = 0;
+    m_send_head = 0;
+    m_post_failure = 0;
+    m_post_fd = -1;
+    m_post_sqe = nullptr;
 }
 
-bool SocketIo::reap() noexcept {
-    bool reaped = false;
-    while (io_uring_cqe* cqe = m_ring.peek_completion()) {
-        auto* completion =
-            static_cast<IoCompletion*>(io_uring_cqe_get_data(cqe));
-        const int cqe_result = cqe->res;
-        m_ring.mark_seen(cqe);
-        if (completion != nullptr) completion->m_result = cqe_result;
-        if (completion != nullptr && completion->m_task != nullptr) {
-            m_runtime->post_completion(m_worker_id, completion->m_task);
-        }
-        // Publish the completion before decrementing pending_io: a worker that
-        // observes zero pending operations then cannot miss the posted task,
-        // so it does not park and pay an eventfd wakeup for a completion that
-        // has already arrived.
-        m_runtime->note_io_completed(m_worker_id);
-        reaped = true;
-    }
-    return reaped;
+bool SocketIo::enqueue(IoRequest& request) noexcept {
+    SB_LAYER(IoPrep);
+    if (!m_running) return false;
+    /* A connection never leaves its worker: its SQEs go to that worker's ring. */
+    if (Runtime::current_ring() != m_ring) detail::no_runtime();
+    const bool receive = request.m_operation == IoOperation::ReadFixed ||
+                         request.m_operation == IoOperation::Recv;
+    /* The receive for a reply right behind its command's send.  It is not
+    linked to the send: a linked request is issued from task work after the
+    send completes (a second pass through the ring, ~0.5 us), while unlinked
+    it is issued in the same submission.  Order does not matter: the receive
+    only waits for data.  A failed send breaks the socket, so the receive
+    fails too, and the send's own CQE reports the error. */
+    const bool follows_send = receive && m_posted_count != 0 && m_post_fd == request.m_fd &&
+                              m_posted[(m_posted_first + m_posted_count - 1) % kMaxPosted]
+                                      .m_epoch == m_ring->submit_epoch();
+    if (!prepare(*m_ring, request)) return false;
+    /* The reply cannot be there the moment the query has been sent: wait for
+    data instead of trying the receive first.  The speculative attempt would
+    take the socket lock (contending with the softirq handling the send's
+    ACK), busy-poll the NIC once and fail, and the receive would run again. */
+    if (follows_send) m_ring->last_sqe()->ioprio |= IORING_RECVSEND_POLL_FIRST;
+    /* A later send must not be chained behind this receive. */
+    if (follows_send) m_post_sqe = nullptr;
+    Runtime::io_issued(&request.m_completion);
+    return true;
 }
-
-void SocketIo::pin() noexcept {
-    pin_to_node(m_numa_node);
-}
-
-void SocketIo::request_stop() noexcept {
-    m_running.store(false, std::memory_order_release);
-    if (m_shutdown_fd >= 0) {
-        const std::uint64_t one = 1;
-        const ssize_t ignored = ::write(m_shutdown_fd, &one, sizeof(one));
-        (void)ignored;
-    }
-}
-
-bool SocketIo::wait() noexcept {
-    // Block until the kernel signals a CQ eventfd (one per posted completion)
-    // or until shutdown.  No spinning: the Runtime owns that policy.
-    if (!m_cq_eventfd_registered) {
-        __kernel_timespec timeout{0, 10'000'000};
-        const int result = m_ring.wait_completion(&timeout);
-        return !(result < 0 && result != -ETIME && result != -EINTR);
-    }
-
-    pollfd descriptors[2] = {
-        pollfd{.fd = m_cq_fd, .events = POLLIN, .revents = 0},
-        pollfd{.fd = m_shutdown_fd, .events = POLLIN, .revents = 0},
-    };
-    const int result = ::poll(descriptors, 2, -1);
-    if (result < 0) return errno == EINTR;
-    if ((descriptors[0].revents & POLLIN) != 0) {
-        std::uint64_t counter = 0;
-        const ssize_t ignored = ::read(m_cq_fd, &counter, sizeof(counter));
-        (void)ignored;
-    }
-    return (descriptors[1].revents & POLLIN) == 0;
-}
-
 
 void SocketReadAwaiter::await_suspend(std::coroutine_handle<>) noexcept {
     (void)enqueue_awaiter(*m_io, m_request);

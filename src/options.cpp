@@ -62,6 +62,8 @@ Options::Options(mem::MemoryResource& resource) : m_resource(&resource) {
     add("histogram", "Print latency histogram", OptionType::Bool, "off");
     add("warmup-time", "Warmup time in seconds", OptionType::Int, "0");
     add("db-driver", "Database driver to use", OptionType::String, "mysql");
+    add("mysql-protocol", "sql-rust protocol revision: 1 (C++) or 2 (Rust client)",
+        OptionType::Int, "1");
     add("mysql-host", "MySQL host", OptionType::String, "127.0.0.1");
     add("mysql-port", "MySQL port", OptionType::String, "3306");
     add("mysql-user", "MySQL user", OptionType::String, "root");
@@ -84,12 +86,22 @@ Options::Options(mem::MemoryResource& resource) : m_resource(&resource) {
         "4G");
     add("populate-memory", "Fault in the global allocation up front",
         OptionType::Bool, "off");
-    add("workers", "Runtime worker threads (max 64; 0 = hardware concurrency)",
+    add("workers", "Runtime worker threads (max 64; 0 = one per --connections-per-worker connections)",
         OptionType::Int, "0");
+    add("connections-per-worker",
+        "Connections served by each worker when --workers is 0 (workers are capped at the CPU count)",
+        OptionType::Int, "2");
+    add("io-busy-poll",
+        "A waiting worker spins in the kernel polling the NIC (io_uring NAPI) instead of in user space; the spin length adapts to observed waits",
+        OptionType::Bool, "off");
     add("numa", "Enable NUMA-aware placement and node-local memory",
         OptionType::Bool, "on");
     add("pin-workers", "Pin worker threads to their assigned CPUs",
         OptionType::Bool, "on");
+    add("lua-heap-size", "Lua heap of each connection (script state, event results)",
+        OptionType::Size, "1M");
+    add("connection-heap-size", "Heap of each connection's MySQL session state",
+        OptionType::Size, "1K");
     add("stall-timeout",
         "Report a stalled connection after N seconds without progress "
         "(0 = wait forever)",

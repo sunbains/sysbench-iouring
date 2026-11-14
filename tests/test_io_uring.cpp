@@ -44,7 +44,7 @@ namespace {
 
 Task<void> socketpair_roundtrip(std::atomic<bool>& ok,
                                 std::atomic<std::uint64_t>& ops) {
-    SocketIo io(*Runtime::current(), Runtime::current_worker_id(), 256, 8, 4096);
+    SocketIo io(*Runtime::current(), Runtime::current_worker_id(), 8, 4096);
     RegisteredBufferPool& pool = io.buffers();
     auto read_buffer = pool.acquire();
     auto write_buffer = pool.acquire();
@@ -75,7 +75,7 @@ Task<void> socketpair_roundtrip(std::atomic<bool>& ok,
 
 Task<void> fixed_roundtrip_loop(int iterations, std::atomic<std::uint64_t>& ops,
                                 std::atomic<bool>& ok) {
-    SocketIo io(*Runtime::current(), Runtime::current_worker_id(), 256, 8, 4096);
+    SocketIo io(*Runtime::current(), Runtime::current_worker_id(), 8, 4096);
     RegisteredBufferPool& pool = io.buffers();
     auto read_buffer = pool.acquire();
     auto write_buffer = pool.acquire();
@@ -107,11 +107,9 @@ Task<void> fixed_roundtrip_loop(int iterations, std::atomic<std::uint64_t>& ops,
 
 Task<void> inspect_pool(std::atomic<bool>& registered_ok,
                         std::atomic<bool>& exhaustion_ok) {
-    SocketIo io(*Runtime::current(), Runtime::current_worker_id(), 256, 8, 4096);
-    IoRing& ring = io.ring();
+    SocketIo io(*Runtime::current(), Runtime::current_worker_id(), 8, 4096);
     RegisteredBufferPool& pool = io.buffers();
-    registered_ok.store(ring.registered_buffers() == pool.slot_count() &&
-                            ring.registered_buffers() > 0,
+    registered_ok.store(pool.slot_count() > 0 && pool.available() == pool.slot_count(),
                         std::memory_order_relaxed);
 
     const unsigned capacity = pool.available();
@@ -131,7 +129,7 @@ Task<void> inspect_pool(std::atomic<bool>& registered_ok,
 }
 
 Task<void> connect_accept(std::atomic<bool>& ok) {
-    SocketIo io(*Runtime::current(), Runtime::current_worker_id(), 256, 2, 4096);
+    SocketIo io(*Runtime::current(), Runtime::current_worker_id(), 2, 4096);
     const int listener = ::socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     const int client = ::socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (listener < 0 || client < 0) {
@@ -240,7 +238,7 @@ TEST("ring connect and accept") {
 Task<void> mass_connect(const char* path, std::size_t path_length,
                         std::atomic<std::uint64_t>& connected,
                         std::atomic<std::uint64_t>& failed) {
-    SocketIo io(*Runtime::current(), Runtime::current_worker_id(), 256, 2, 4096);
+    SocketIo io(*Runtime::current(), Runtime::current_worker_id(), 2, 4096);
     const int fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (fd < 0) {
         failed.fetch_add(1, std::memory_order_relaxed);
@@ -266,7 +264,7 @@ Task<void> mass_connect(const char* path, std::size_t path_length,
 Task<void> mass_accept(int listener, std::size_t count,
                        std::atomic<std::uint64_t>& accepted,
                        std::atomic<std::uint64_t>& failed) {
-    SocketIo io(*Runtime::current(), Runtime::current_worker_id(), 256, 2, 4096);
+    SocketIo io(*Runtime::current(), Runtime::current_worker_id(), 2, 4096);
     for (std::size_t i = 0; i < count; ++i) {
         sockaddr_un peer{};
         socklen_t peer_length = sizeof(peer);

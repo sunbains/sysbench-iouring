@@ -22,6 +22,14 @@
 #include <cmath>
 
 namespace sb {
+
+namespace {
+// Add to a counter whose only writer is the calling thread: load and store,
+// no locked read-modify-write (readers on other threads see whole values).
+inline void bump(std::atomic<std::uint64_t>& counter, std::uint64_t delta) noexcept {
+    counter.store(counter.load(std::memory_order_relaxed) + delta, std::memory_order_relaxed);
+}
+}  // namespace
 namespace {
 
 constexpr unsigned kSubBins = 8;
@@ -111,6 +119,30 @@ QueryKind classify_query(std::string_view sql) noexcept {
         starts_with_ci(sql, "WITH")) {
         return QueryKind::Read;
     }
+    if (starts_with_ci(sql, "HANDLER") && sql.size() > 7 &&
+        std::isspace(static_cast<unsigned char>(sql[7])) != 0) {
+        sql = trim_left(sql.substr(7));
+        // Skip the table identifier, including spaces and escaped backticks in
+        // quoted names. OPEN/CLOSE are setup commands, whereas READ is a read.
+        bool quoted = false;
+        std::size_t end = 0;
+        for (; end < sql.size(); ++end) {
+            if (sql[end] == '`') {
+                if (quoted && end + 1 < sql.size() && sql[end + 1] == '`') {
+                    ++end;
+                } else {
+                    quoted = !quoted;
+                }
+            } else if (!quoted &&
+                       std::isspace(static_cast<unsigned char>(sql[end])) != 0) {
+                break;
+            }
+        }
+        sql = trim_left(sql.substr(end));
+        return starts_with_ci(sql, "READ") && sql.size() > 4 &&
+                       std::isspace(static_cast<unsigned char>(sql[4])) != 0
+                   ? QueryKind::Read : QueryKind::Other;
+    }
     if (starts_with_ci(sql, "INSERT") || starts_with_ci(sql, "UPDATE") ||
         starts_with_ci(sql, "DELETE") || starts_with_ci(sql, "REPLACE") ||
         starts_with_ci(sql, "ALTER") || starts_with_ci(sql, "CREATE") ||
@@ -125,8 +157,10 @@ QueryKind classify_query(std::string_view sql) noexcept {
     return QueryKind::Other;
 }
 
+// One writer per histogram (its benchmark thread): plain load and store, no
+// locked read-modify-write.  The reporter only reads.
 void LatencyHistogram::record(std::uint64_t nanoseconds) noexcept {
-    m_bins[bin_for(nanoseconds)].fetch_add(1, std::memory_order_relaxed);
+    bump(m_bins[bin_for(nanoseconds)], 1);
 }
 
 std::size_t LatencyHistogram::bin_for(std::uint64_t nanoseconds) noexcept {
@@ -189,8 +223,8 @@ void ThreadStats::end_event(std::chrono::steady_clock::time_point end,
 
 void ThreadStats::record_event_latency(std::uint64_t nanoseconds,
                                        bool error) noexcept {
-    m_events.fetch_add(1, std::memory_order_relaxed);
-    m_latency_sum_ns.fetch_add(nanoseconds, std::memory_order_relaxed);
+    bump(m_events, 1);
+    bump(m_latency_sum_ns, nanoseconds);
     m_latency.record(nanoseconds);
     if (nanoseconds > m_max_local) {
         m_max_local = nanoseconds;
@@ -200,28 +234,28 @@ void ThreadStats::record_event_latency(std::uint64_t nanoseconds,
         m_min_local = nanoseconds;
         m_latency_min_ns.store(nanoseconds, std::memory_order_relaxed);
     }
-    if (error) m_errors.fetch_add(1, std::memory_order_relaxed);
+    if (error) bump(m_errors, 1);
 }
 
 void ThreadStats::record_query(QueryKind kind, std::uint64_t bytes_read,
                                std::uint64_t bytes_written) noexcept {
     switch (kind) {
-        case QueryKind::Read: m_reads.fetch_add(1, std::memory_order_relaxed); break;
-        case QueryKind::Write: m_writes.fetch_add(1, std::memory_order_relaxed); break;
-        default: m_other.fetch_add(1, std::memory_order_relaxed); break;
+        case QueryKind::Read: bump(m_reads, 1); break;
+        case QueryKind::Write: bump(m_writes, 1); break;
+        default: bump(m_other, 1); break;
     }
-    if (bytes_read != 0) m_bytes_read.fetch_add(bytes_read, std::memory_order_relaxed);
+    if (bytes_read != 0) bump(m_bytes_read, bytes_read);
     if (bytes_written != 0) {
-        m_bytes_written.fetch_add(bytes_written, std::memory_order_relaxed);
+        bump(m_bytes_written, bytes_written);
     }
 }
 
 void ThreadStats::record_error() noexcept {
-    m_errors.fetch_add(1, std::memory_order_relaxed);
+    bump(m_errors, 1);
 }
 
 void ThreadStats::record_reconnect() noexcept {
-    m_reconnects.fetch_add(1, std::memory_order_relaxed);
+    bump(m_reconnects, 1);
 }
 
 StatsSnapshot aggregate(std::span<ThreadStats* const> threads, double percentile) {

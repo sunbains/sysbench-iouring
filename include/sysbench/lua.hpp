@@ -42,6 +42,11 @@ struct LuaRunOptions {
     std::uint32_t m_percentile = 95;
     bool m_histogram = false;
     std::uint64_t m_seed = 0;
+    // Each connection (benchmark task) owns two heaps, neither tied to a
+    // worker: the Lua heap (the script's state and each event's results) and
+    // the connection heap (the MySQL session state and its counters).
+    std::uint64_t m_lua_heap_bytes = 1024ull * 1024;
+    std::uint64_t m_connection_heap_bytes = 1024;
 };
 
 // Owns the script's bootstrap Lua state and runs benchmark/command states on

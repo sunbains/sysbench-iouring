@@ -131,6 +131,7 @@ struct ConnectionOptions {
     std::string_view m_password;
     std::string_view m_database;
     std::string_view m_socket_path;
+    std::uint32_t m_protocol_version = 1;
     std::uint32_t m_connect_timeout_ms = 5000;
     std::uint32_t m_max_packet_size = 16 * 1024 * 1024;
     TlsMode m_tls_mode = TlsMode::Disabled;
@@ -155,6 +156,34 @@ public:
     virtual Task<QueryResult> query(std::string_view sql,
                                     mem::MemoryResource& result_resource) = 0;
     virtual Task<PrepareResult> prepare(std::string_view sql) = 0;
+    // Run `total` copies of sql keeping up to `depth` in flight on the
+    // connection: the next query is written as soon as a result is read.
+    // Results are read and discarded.
+    // Drivers that cannot keep several commands in flight run them one by one.
+    virtual Task<Status> query_stream(std::string_view sql, std::uint32_t depth,
+                                      std::uint64_t total,
+                                      mem::MemoryResource& scratch) {
+        (void)depth;
+        for (std::uint64_t i = 0; i < total; ++i) {
+            auto result = co_await query(sql, scratch);
+            if (result.is_err()) co_return Status::err(result.error());
+        }
+        co_return Status::ok();
+    }
+    // Pipelining: send_query() writes a command without reading its reply;
+    // read_reply() reads (and discards) the oldest outstanding reply.  Replies
+    // come back in command order.  Drivers that cannot pipeline run the
+    // command to completion in send_query() and never have replies pending.
+    virtual Task<Status> send_query(std::string_view sql, mem::MemoryResource& scratch) {
+        auto result = co_await query(sql, scratch);
+        if (result.is_err()) co_return Status::err(result.error());
+        co_return Status::ok();
+    }
+    virtual Task<Status> read_reply(mem::MemoryResource& scratch) {
+        (void)scratch;
+        co_return Status::ok();
+    }
+    [[nodiscard]] virtual std::uint32_t pending_replies() const noexcept { return 0; }
     virtual Task<Status> reconnect() = 0;
     virtual void close() noexcept = 0;
     [[nodiscard]] virtual bool healthy() const noexcept = 0;
@@ -170,6 +199,14 @@ public:
 
     virtual Task<QueryResult> execute(std::span<const BindValue> parameters,
                                       mem::MemoryResource& result_resource) = 0;
+    // Pipelined execute: write the command and leave its reply to
+    // Connection::read_reply().  The default runs it to completion.
+    virtual Task<Status> send_execute(std::span<const BindValue> parameters,
+                                      mem::MemoryResource& scratch) {
+        auto result = co_await execute(parameters, scratch);
+        if (result.is_err()) co_return Status::err(result.error());
+        co_return Status::ok();
+    }
     virtual Task<Status> close() = 0;
     [[nodiscard]] virtual bool closed() const noexcept = 0;
     [[nodiscard]] virtual std::string_view sql() const noexcept = 0;
