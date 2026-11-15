@@ -182,6 +182,21 @@ struct alignas(4096) Runtime::Worker {
     std::uint32_t m_napi_us = 0;
     // Requests issued and not yet reaped.
     std::uint32_t m_in_flight = 0;
+#if defined(SYSBENCH_TURNAROUND)
+    /* Client turnaround: TSC from reaping an awaited reply to the next
+    submission that carries new requests (our code's share of a round trip). */
+    std::uint64_t m_reply_reaped = 0;
+    std::uint64_t m_turnaround_cycles = 0;
+    std::uint64_t m_turnarounds = 0;
+public:
+    void note_submit() noexcept {
+        if (m_reply_reaped != 0 && m_ring->queued() != 0) {
+            m_turnaround_cycles += tsc_now() - m_reply_reaped;
+            ++m_turnarounds;
+            m_reply_reaped = 0;
+        }
+    }
+#endif
 
     /* ---- Learned waits ---------------------------------------------------
     A task that suspends on I/O has declared what it waits for (the awaiter's
@@ -214,14 +229,25 @@ struct alignas(4096) Runtime::Worker {
                              : m_wait_cycles[static_cast<unsigned>(WaitKind::Send)];
     }
 
+    // Requests in flight that no task awaited when they were issued (posted
+    // sends): their CQEs must not end a wait for an awaited one.
+    std::uint32_t m_unawaited = 0;
+
     void issued(IoCompletion* completion) noexcept {
         ++m_in_flight;
         completion->m_done = false;
+        /* A multishot request is armed once and stays: it is neither an
+        awaited wait to time nor a send whose CQE a wait must look past. */
+        if (completion->m_on_cqe != nullptr) {
+            completion->m_issued = 0;
+            return;
+        }
         if (completion->m_task != nullptr) {
             completion->m_issued = tsc_now();
             ++m_awaited[static_cast<unsigned>(completion->m_kind)];
         } else {
             completion->m_issued = 0;
+            ++m_unawaited;
         }
     }
 
@@ -279,14 +305,37 @@ struct alignas(4096) Runtime::Worker {
             for (unsigned i = 0; i < count; ++i) {
                 auto* completion = static_cast<IoCompletion*>(io_uring_cqe_get_data(cqes[i]));
                 if (completion == nullptr) continue;
-                completion->m_result = cqes[i]->res;
+                if (completion->m_on_cqe != nullptr) {
+#if defined(SYSBENCH_TURNAROUND)
+                    if (m_reply_reaped == 0) m_reply_reaped = tsc_now();
+#endif
+                    const unsigned flags = cqes[i]->flags;
+                    if ((flags & IORING_CQE_F_MORE) == 0) --m_in_flight;
+                    if (PromiseBase* task = completion->m_on_cqe(completion, cqes[i]->res, flags))
+                        tasks[runnable++] = task;
+                    continue;
+                }
+                /* A zero-copy send posts its result (F_MORE: more to come)
+                and later a notification (F_NOTIF) when the kernel has let go
+                of the buffer: only the notification completes it. */
+                const unsigned cqe_flags = cqes[i]->flags;
+                if ((cqe_flags & IORING_CQE_F_MORE) != 0) {
+                    completion->m_result = cqes[i]->res;
+                    continue;
+                }
+                if ((cqe_flags & IORING_CQE_F_NOTIF) == 0) completion->m_result = cqes[i]->res;
                 completion->m_done = true;
                 --m_in_flight;
+#if defined(SYSBENCH_TURNAROUND)
+                if (completion->m_kind == WaitKind::Reply && m_reply_reaped == 0) m_reply_reaped = tsc_now();
+#endif
                 if (completion->m_issued != 0) {
                     if (now == 0) now = tsc_now();
                     observe_wait(completion->m_kind, now - completion->m_issued);
                     --m_awaited[static_cast<unsigned>(completion->m_kind)];
                     completion->m_issued = 0;
+                } else {
+                    --m_unawaited;
                 }
                 if (completion->m_orphan) {
                     release_send(completion);
@@ -306,6 +355,9 @@ struct alignas(4096) Runtime::Worker {
     // One non-blocking kernel entry (only when there is something to submit or
     // collect), then reap.
     bool poll_io() noexcept {
+#if defined(SYSBENCH_TURNAROUND)
+        note_submit();
+#endif
         if (m_ring->queued() != 0 || m_ring->task_work_pending()) m_ring->submit_and_collect();
         return reap();
     }
@@ -443,7 +495,12 @@ struct alignas(4096) Runtime::Worker {
     re-registered as the estimate moves.  Without it the spin polls the CQ
     and the task-work flag from user space. */
     void wait_io() noexcept {
-        const std::uint64_t budget = expected_wait_cycles();
+        /* The rule: spin only while the runtime is undersubscribed (no more
+        tasks than workers).  Oversubscribed, another task is always about to
+        be runnable, so a worker never spins: it blocks in one kernel wait that
+        also submits its batch. */
+        const bool may_spin = m_runtime->m_undersubscribed.load(std::memory_order_relaxed);
+        const std::uint64_t budget = may_spin ? expected_wait_cycles() : 0;
         if (m_ring->napi_enabled()) {
             const auto busy_us = static_cast<std::uint32_t>(
                 std::clamp<std::uint64_t>(cycles_to_ns(budget) / 1000, 1, 1'000'000));
@@ -451,7 +508,7 @@ struct alignas(4096) Runtime::Worker {
             if (busy_us > m_napi_us + m_napi_us / 4 || busy_us + busy_us / 4 < m_napi_us) {
                 if (m_ring->enable_napi(busy_us)) m_napi_us = busy_us;
             }
-        } else {
+        } else if (may_spin) {
             const std::uint64_t start = tsc_now();
             for (std::uint32_t spins = 1;; ++spins) {
                 if (poll_io() || have_work()) return;
@@ -472,8 +529,17 @@ struct alignas(4096) Runtime::Worker {
         }
         __kernel_timespec timeout{.tv_sec = static_cast<long long>(limit.count() / 1'000'000'000),
                                   .tv_nsec = static_cast<long long>(limit.count() % 1'000'000'000)};
-        m_ring->submit_and_wait(&timeout);
-        if (!poll_io()) check_stall();
+        /* Wait for one completion more than there are unawaited sends in
+        flight: a send's CQE (posted the moment it is submitted) must not end
+        the wait for the reply, or every round trip takes a second syscall.
+        Everything posted earlier has been reaped, so the CQ starts empty. */
+#if defined(SYSBENCH_TURNAROUND)
+        note_submit();
+#endif
+        m_ring->submit_and_wait(&timeout, m_unawaited + 1);
+        /* The wait ran the completion work it needed; whatever else is
+        pending is collected by the next wait, not by another syscall. */
+        if (!(m_ring->napi_enabled() ? reap() : poll_io())) check_stall();
     }
 
     /* Idle (nothing in flight, nothing ready): one worker per NUMA node may
@@ -511,7 +577,7 @@ struct alignas(4096) Runtime::Worker {
     /* Nothing in flight and nothing ready: only a new task, a timer or exit
     can give this worker work.  Futex wait, no spin. */
     void wait_idle() {
-        if (spin_idle()) return;
+        if (m_runtime->m_undersubscribed.load(std::memory_order_relaxed) && spin_idle()) return;
         const std::uint32_t seen = m_wake_word.load(std::memory_order_seq_cst);
         m_waiting.store(true, std::memory_order_seq_cst);
         if (m_injected.load(std::memory_order_seq_cst) != nullptr ||
@@ -567,7 +633,15 @@ struct alignas(4096) Runtime::Worker {
         }
         set_thread_name(m_numa_node >= 0 ? "sb-worker-n" : "sb-worker");
         if (m_runtime->m_config.m_pin_workers) {
-            if (m_numa_node >= 0) {
+            /* One CPU per worker: the CPU decides the NIC TX queue (XPS), and
+            connections are steered so their replies come back on it. */
+            /* More workers than CPUs (blocking I/O runs one per connection):
+            pin them to their node and let the kernel balance them, as it
+            does sysbench's threads, instead of stacking two on one CPU. */
+            const bool oversubscribed = m_runtime->m_worker_count > Runtime::hardware_workers();
+            if (m_numa_node >= 0 && m_cpu >= 0 && !oversubscribed) {
+                set_thread_affinity(static_cast<std::uint32_t>(m_cpu));
+            } else if (m_numa_node >= 0) {
                 const numa::Topology& topology = numa::Topology::instance();
                 const numa::NodeInfo* info = topology.node_by_id(m_numa_node);
                 if (info != nullptr) {
@@ -586,11 +660,23 @@ struct alignas(4096) Runtime::Worker {
             } else {
                 set_thread_affinity(m_runtime->m_config.m_first_cpu + m_id);
             }
+        } else {
+            /* Unpinned: the kernel places the worker, on any CPU the process
+            started with but the main thread's.  Without this it would inherit
+            the main thread's single-CPU mask and every worker would share it. */
+            const numa::Topology& topology = numa::Topology::instance();
+            cpu_set_t set = topology.process_cpus();
+            if (topology.reserved_cpu() >= 0 && CPU_COUNT(&set) > 1) {
+                CPU_CLR(topology.reserved_cpu(), &set);
+            }
+            (void)::pthread_setaffinity_np(::pthread_self(), sizeof(set), &set);
         }
 
         layer::register_thread();
         m_ring.emplace(m_runtime->m_config.m_ring_entries, IoRing::worker_flags());
         for (auto& estimate : m_wait_cycles) estimate = ns_to_cycles(kInitialWaitNs);
+        m_ring->set_send_zc(m_runtime->m_config.m_send_zc);
+        m_ring->set_direct_send(m_runtime->m_config.m_direct_send || m_runtime->m_config.m_blocking_io);
         if (m_runtime->m_config.m_busy_poll) {
             m_napi_us = static_cast<std::uint32_t>(kInitialWaitNs / 1000);
             if (!m_ring->enable_napi(m_napi_us)) m_napi_us = 0;
@@ -611,8 +697,15 @@ struct alignas(4096) Runtime::Worker {
             process_deferred();
 
             /* Submit the batch and reap whatever has completed, resuming each
-            connection as its result comes in: no wait. */
-            (void)poll_io();
+            connection as its result comes in: no wait.  When the worker waits
+            in the kernel (NAPI), the wait itself submits the batch: one
+            io_uring_enter per round trip carries the send, the busy poll and
+            the receive, so here it only reaps what is already posted. */
+            if (m_ring->napi_enabled()) {
+                (void)reap();
+            } else {
+                (void)poll_io();
+            }
             /* Tasks resumed while reaping may have finished: retire them now,
             or a worker could go idle holding the last outstanding task. */
             process_completed();
@@ -632,6 +725,14 @@ struct alignas(4096) Runtime::Worker {
         drain_injected();
         process_completed();
         process_deferred();
+#if defined(SYSBENCH_TURNAROUND)
+        if (m_turnarounds != 0) {
+            std::fprintf(stderr, "worker %u turnaround: %.3f us per reply (%llu replies)\n", m_id,
+                         static_cast<double>(m_turnaround_cycles) / static_cast<double>(m_turnarounds) /
+                             g_cycles_per_ns / 1000.0,
+                         static_cast<unsigned long long>(m_turnarounds));
+        }
+#endif
         m_ring.reset();
         detail::tls_worker = nullptr;
     }
@@ -801,6 +902,23 @@ void Runtime::io_issued(IoCompletion* completion) noexcept {
     auto* worker = static_cast<Worker*>(detail::tls_worker);
     if (worker == nullptr) detail::no_runtime();
     worker->issued(completion);
+}
+
+void Runtime::wait_started(IoCompletion* completion) noexcept {
+    auto* worker = static_cast<Worker*>(detail::tls_worker);
+    if (worker == nullptr) detail::no_runtime();
+    if (completion->m_issued == 0) {
+        completion->m_issued = tsc_now();
+        ++worker->m_awaited[static_cast<unsigned>(completion->m_kind)];
+    }
+}
+
+void Runtime::wait_finished(IoCompletion* completion) noexcept {
+    auto* worker = static_cast<Worker*>(detail::tls_worker);
+    if (worker == nullptr || completion->m_issued == 0) return;
+    worker->observe_wait(completion->m_kind, tsc_now() - completion->m_issued);
+    --worker->m_awaited[static_cast<unsigned>(completion->m_kind)];
+    completion->m_issued = 0;
 }
 
 IoCompletion* Runtime::acquire_send_completion() {

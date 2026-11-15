@@ -28,6 +28,7 @@
 #include <array>
 #include <cstring>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 using namespace sb;
@@ -330,6 +331,81 @@ TEST("binary rows decode numeric and string columns") {
     CHECK_EQ(std::string_view(row.m_fields[2].m_data, row.m_fields[2].m_length), "3.5");
     CHECK_EQ(std::string_view(row.m_fields[3].m_data, row.m_fields[3].m_length), "hello");
     CHECK(row.m_fields[4].m_is_null);
+}
+
+TEST("rows append into one flat result, row after row") {
+    mem::RootArena root(1024 * 1024);
+    db::ResultSet result(root);
+    result.m_columns.resize(3);
+    for (int i = 0; i < 4; ++i) {
+        Bytes payload = fixture_text_row(root);
+        CHECK(parse_text_row(payload, 3, root, result.m_fields));
+        ++result.m_row_count;
+    }
+    CHECK_EQ(result.row_count(), 4u);
+    CHECK_EQ(result.width(), 3u);
+    CHECK_EQ(result.m_fields.size(), 12u);
+    for (std::size_t r = 0; r < result.row_count(); ++r) {
+        const auto row = result.row(r);
+        CHECK_EQ(row.size(), 3u);
+        CHECK_EQ(std::string_view(row[0].m_data, row[0].m_length), "abc");
+        CHECK(!row[1].m_is_null);
+        CHECK(row[2].m_is_null);
+    }
+    result.m_affected_rows = 7;
+    result.reset(root);
+    CHECK_EQ(result.row_count(), 0u);
+    CHECK_EQ(result.width(), 0u);
+    CHECK(result.m_fields.empty());
+    CHECK_EQ(result.m_affected_rows, 0u);
+    static_assert(std::is_trivially_destructible_v<db::Field> &&
+                  std::is_trivially_destructible_v<db::Column>);
+}
+
+TEST("binary integer columns format every width and sign") {
+    mem::RootArena root(1024 * 1024);
+    db::Column columns[6];
+    columns[0].m_type = TYPE_TINY;
+    columns[1].m_type = TYPE_SHORT;
+    columns[2].m_type = TYPE_LONG;
+    columns[3].m_type = TYPE_LONGLONG;
+    columns[4].m_type = TYPE_LONGLONG;
+    columns[4].m_flags = UNSIGNED_FLAG;
+    columns[5].m_type = TYPE_TINY;
+    columns[5].m_flags = UNSIGNED_FLAG;
+
+    Bytes payload = make_bytes(root);
+    Writer writer(payload);
+    writer.u8(0);
+    writer.u8(0);  // null bitmap: (6 + 7 + 2) / 8 = 1 byte, none null
+    writer.u8(0x80);                                         // -128
+    writer.u16(0x8000);                                      // -32768
+    writer.u32(0x80000000u);                                 // INT32_MIN
+    writer.u64(0x8000000000000000ull);                       // INT64_MIN
+    writer.u64(0xffffffffffffffffull);                       // UINT64_MAX
+    writer.u8(255);
+
+    db::Row row(root);
+    CHECK(parse_binary_row(payload, columns, root, row));
+    const char* expected[] = {"-128", "-32768", "-2147483648", "-9223372036854775808",
+                              "18446744073709551615", "255"};
+    CHECK_EQ(row.m_fields.size(), 6u);
+    for (std::size_t i = 0; i < 6 && i < row.m_fields.size(); ++i) {
+        CHECK_EQ(std::string_view(row.m_fields[i].m_data, row.m_fields[i].m_length),
+                 std::string_view(expected[i]));
+    }
+}
+
+TEST("prepared-statement execute payload without types") {
+    mem::RootArena root(1024 * 1024);
+    Bytes payload = make_bytes(root);
+    const db::BindValue values[] = {db::BindValue::from_int(7)};
+    build_stmt_execute_payload(payload, 9, values, false);
+    // command, id, flags, iteration count, null bitmap, new-params-bound = 0,
+    // then the value alone: 1 + 4 + 1 + 4 + 1 + 1 + 8 bytes.
+    CHECK_EQ(payload.size(), 20u);
+    CHECK_EQ(std::to_integer<int>(payload[11]), 0);
+    CHECK_EQ(std::to_integer<int>(payload[12]), 7);
 }
 
 TEST("prepared-statement execute payload") {

@@ -135,6 +135,78 @@ private:
     io_uring_sqe* m_post_sqe = nullptr;
 };
 
+// A connection's receive armed once (multishot) into a ring of provided
+// buffers: every arrival posts a CQE naming the buffer it filled, and the
+// request stays armed.  No receive SQE, no poll arming per reply.
+//
+// Receivers belong to the worker: a connection acquire()s one armed on its
+// socket and abandon()s it when it closes, without waiting; the receiver
+// goes back to the worker's pool when the kernel ends the multishot (the
+// socket's shutdown does), so a late CQE never reaches freed memory.
+class MultishotReceiver {
+public:
+    static constexpr unsigned kBuffers = 16;
+    static constexpr unsigned kBufferSize = 16 * 1024;
+
+    [[nodiscard]] static MultishotReceiver* acquire(int fd);
+    void abandon() noexcept;
+
+    // Copy the next received bytes (at most `capacity`) to `destination`:
+    // the count, 0 at end of stream, or -errno.  Bytes beyond `capacity`
+    // stay for the next call.
+    class ReceiveAwaiter {
+    public:
+        ReceiveAwaiter(MultishotReceiver& receiver, std::byte* destination, unsigned capacity) noexcept
+            : m_receiver(&receiver), m_destination(destination), m_capacity(capacity) {}
+        [[nodiscard]] bool await_ready() noexcept { return m_receiver->ready(); }
+        void await_suspend(std::coroutine_handle<>) noexcept { m_receiver->wait(); }
+        int await_resume() noexcept { return m_receiver->take(m_destination, m_capacity); }
+
+    private:
+        MultishotReceiver* m_receiver;
+        std::byte* m_destination;
+        unsigned m_capacity;
+    };
+    [[nodiscard]] ReceiveAwaiter receive_into(std::byte* destination, unsigned capacity) noexcept {
+        return ReceiveAwaiter(*this, destination, capacity);
+    }
+
+    // The awaiter's steps, for awaiters that wrap this one.
+    [[nodiscard]] bool ready() noexcept;
+    void wait() noexcept;
+    int take(std::byte* destination, unsigned capacity) noexcept;
+
+private:
+    MultishotReceiver();
+    static detail::PromiseBase* on_cqe(IoCompletion* completion, int result, unsigned flags);
+    void arm() noexcept;
+    void release(unsigned buffer) noexcept;
+    void recycle() noexcept;
+
+    IoCompletion m_completion{};
+    int m_fd = -1;
+    std::uint16_t m_group = 0;
+    io_uring_buf_ring* m_ring = nullptr;
+    std::byte* m_memory = nullptr;
+    bool m_armed = false;
+    bool m_abandoned = false;
+    bool m_ended = false;   // the stream ended (0) or failed: keep reporting it
+    int m_end_result = 0;
+    MultishotReceiver* m_next_free = nullptr;
+    // Unconsumed tail of the buffer last taken from.
+    unsigned m_partial_buffer = 0;
+    unsigned m_partial_offset = 0;
+    unsigned m_partial_length = 0;
+    static constexpr unsigned kEvents = 64;
+    struct Raw {
+        int m_result;
+        unsigned m_flags;
+    };
+    Raw m_events[kEvents]{};
+    unsigned m_first = 0;
+    unsigned m_count = 0;
+};
+
 // Await a posted send's completion: the task is parked on the CQE and the
 // worker runs other tasks meanwhile.
 class PostedSendAwaiter {

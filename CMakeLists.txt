@@ -39,6 +39,7 @@ add_library(sysbench_core STATIC
     src/db.cpp
     src/stats.cpp
     src/layer_stats.cpp
+    src/nic_queues.cpp
     src/options.cpp
     src/mysql_wire.cpp
     src/mysql_connection.cpp
@@ -79,8 +80,15 @@ target_compile_definitions(sysbench_core PUBLIC
 if(SYSBENCH_LAYER_STATS)
     target_compile_definitions(sysbench_core PUBLIC SYSBENCH_LAYER_STATS=1)
 endif()
+option(SYSBENCH_TURNAROUND "Report the client turnaround (reply reaped to next submit) per worker" OFF)
+if(SYSBENCH_TURNAROUND)
+    target_compile_definitions(sysbench_core PUBLIC SYSBENCH_TURNAROUND=1)
+endif()
 
 add_executable(sysbench26 src/main.cpp)
+# One-connection prepared SELECT 1, one layer at a time (diagnostics).
+add_executable(sb_netbench tools/netbench.cpp)
+target_link_libraries(sb_netbench PRIVATE sysbench_core)
 if(SYSBENCH_MYSQL_V2)
     include(cmake/MySQLV2.cmake)
 endif()

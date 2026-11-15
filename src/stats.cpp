@@ -82,8 +82,9 @@ std::string_view trim_left(std::string_view value) {
     return value;
 }
 
-char upper(char value) {
-    return static_cast<char>(std::toupper(static_cast<unsigned char>(value)));
+// ASCII case fold (SQL keywords): no locale call per character.
+constexpr char upper(char value) noexcept {
+    return value >= 'a' && value <= 'z' ? static_cast<char>(value - ('a' - 'A')) : value;
 }
 
 bool starts_with_ci(std::string_view value, std::string_view prefix) {

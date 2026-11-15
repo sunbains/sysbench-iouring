@@ -632,11 +632,11 @@ Task<void> client_flow(std::uint16_t port, std::atomic<int>& stages,
         } else {
             const db::ResultSet& rows = result.value();
             ok.store(rows.m_has_rows && rows.m_columns.size() == 1 &&
-                         rows.m_rows.size() == 1 &&
-                         rows.m_rows[0].m_fields.size() == 1 &&
-                         !rows.m_rows[0].m_fields[0].m_is_null &&
-                         std::string_view(rows.m_rows[0].m_fields[0].m_data,
-                                          rows.m_rows[0].m_fields[0].m_length) == "1",
+                         rows.row_count() == 1 &&
+                         rows.row(0).size() == 1 &&
+                         !rows.row(0)[0].m_is_null &&
+                         std::string_view(rows.row(0)[0].m_data,
+                                          rows.row(0)[0].m_length) == "1",
                      std::memory_order_relaxed);
         }
         stages.fetch_add(1);
@@ -668,10 +668,10 @@ Task<void> client_flow(std::uint16_t port, std::atomic<int>& stages,
                 ok.store(false, std::memory_order_relaxed);
             } else {
                 const db::ResultSet& rows = result.value();
-                ok.store(ok.load() && rows.m_has_rows && rows.m_rows.size() == 1 &&
-                             rows.m_rows[0].m_fields.size() == 1 &&
-                             std::string_view(rows.m_rows[0].m_fields[0].m_data,
-                                              rows.m_rows[0].m_fields[0].m_length) == "42",
+                ok.store(ok.load() && rows.m_has_rows && rows.row_count() == 1 &&
+                             rows.row(0).size() == 1 &&
+                             std::string_view(rows.row(0)[0].m_data,
+                                              rows.row(0)[0].m_length) == "42",
                          std::memory_order_relaxed);
             }
             stages.fetch_add(1);
@@ -764,18 +764,18 @@ Task<void> returning_flow(std::uint16_t port, bool reconnect, std::atomic<bool>&
             CHECK(result.m_has_rows);
             CHECK(!result.m_more_results);
             CHECK_EQ(result.m_columns.size(), 3u);
-            CHECK_EQ(result.m_rows.size(), 2u);
+            CHECK_EQ(result.row_count(), 2u);
             CHECK_EQ(result.m_affected_rows, 2u);
             CHECK_EQ(result.m_last_insert_id, 41u);
             CHECK_EQ(result.m_warnings, 3);
             CHECK_EQ(result.m_status, 2);
-            if (result.m_rows.size() == 2 && result.m_columns.size() == 3) {
+            if (result.row_count() == 2 && result.m_columns.size() == 3) {
                 CHECK_EQ(result.m_columns[0].m_name, "c");
-                CHECK_EQ(field_text(result.m_rows[0].m_fields[0]), "");
-                CHECK(!result.m_rows[0].m_fields[0].m_is_null);
-                CHECK(result.m_rows[0].m_fields[2].m_is_null);
-                CHECK_EQ(field_text(result.m_rows[1].m_fields[0]), "41");
-                CHECK_EQ(field_text(result.m_rows[1].m_fields[1]), "42");
+                CHECK_EQ(field_text(result.row(0)[0]), "");
+                CHECK(!result.row(0)[0].m_is_null);
+                CHECK(result.row(0)[2].m_is_null);
+                CHECK_EQ(field_text(result.row(1)[0]), "41");
+                CHECK_EQ(field_text(result.row(1)[1]), "42");
             }
         } else {
             std::println(stderr, "v2 RETURNING failed: {}", query.error().message());
@@ -786,7 +786,7 @@ Task<void> returning_flow(std::uint16_t port, bool reconnect, std::atomic<bool>&
     {
         auto query = co_await connection->query("SELECT 1", arena);
         CHECK(query.is_ok());
-        if (query.is_ok()) CHECK_EQ(query.value().m_rows.size(), 1u);
+        if (query.is_ok()) CHECK_EQ(query.value().row_count(), 1u);
     }
     {
         auto query = co_await connection->query("FAIL", arena);
@@ -807,11 +807,11 @@ Task<void> returning_flow(std::uint16_t port, bool reconnect, std::atomic<bool>&
         auto query = co_await statement->execute(parameters, arena);
         CHECK(query.is_ok());
         if (query.is_ok()) {
-            CHECK_EQ(query.value().m_rows.size(), 1u);
+            CHECK_EQ(query.value().row_count(), 1u);
             CHECK_EQ(query.value().m_affected_rows, 1u);
             CHECK_EQ(query.value().m_last_insert_id, 42u);
-            if (!query.value().m_rows.empty()) {
-                CHECK_EQ(field_text(query.value().m_rows[0].m_fields[0]), "42");
+            if (!query.value().row_count() == 0) {
+                CHECK_EQ(field_text(query.value().row(0)[0]), "42");
             }
         }
     }
@@ -1062,7 +1062,7 @@ TEST("MySQL query throughput over a local mock server") {
             mem::ScopedAllocator scope(arena);
             auto result = co_await connection->query("SELECT 1", scope);
             if (result.is_err() || !result.value().m_has_rows ||
-                result.value().m_rows.size() != 1) {
+                result.value().row_count() != 1) {
                 ok.store(false);
                 break;
             }
@@ -1131,7 +1131,7 @@ TEST("MySQL concurrent point-select throughput") {
             mem::ScopedAllocator scope(arena);
             auto result = co_await connection->query("SELECT 1", scope);
             if (result.is_err() || !result.value().m_has_rows ||
-                result.value().m_rows.size() != 1) {
+                result.value().row_count() != 1) {
                 failures.fetch_add(1, std::memory_order_relaxed);
                 break;
             }

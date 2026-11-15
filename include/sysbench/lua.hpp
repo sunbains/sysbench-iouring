@@ -46,7 +46,7 @@ struct LuaRunOptions {
     // worker: the Lua heap (the script's state and each event's results) and
     // the connection heap (the MySQL session state and its counters).
     std::uint64_t m_lua_heap_bytes = 1024ull * 1024;
-    std::uint64_t m_connection_heap_bytes = 1024;
+    std::uint64_t m_connection_heap_bytes = 8 * 1024;
 };
 
 // Owns the script's bootstrap Lua state and runs benchmark/command states on

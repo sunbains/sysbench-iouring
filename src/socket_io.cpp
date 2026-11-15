@@ -17,6 +17,10 @@
 #include "sysbench/socket_io.hpp"
 
 #include <cerrno>
+#include <cstddef>
+#include <cstring>
+#include <algorithm>
+#include <system_error>
 
 #include "sysbench/layer_stats.hpp"
 
@@ -158,6 +162,22 @@ std::byte* SocketIo::stage_send(std::size_t length, IoCompletion*& blocker) {
 bool SocketIo::post_send(int fd, std::byte* buffer, unsigned length) {
     SB_LAYER(IoPrep);
     if (!m_running) return false;
+    /* Direct send: with nothing of this socket's in flight, hand the bytes
+    to the kernel now.  A small send completes inline either way; doing it as
+    a plain send() skips io_uring's request around tcp_sendmsg, and the
+    buffer is free again at once.  What does not go out (a full socket) goes
+    through the ring, behind nothing, so order is kept. */
+    if (m_ring->direct_send() && m_posted_count == 0) {
+        const ssize_t sent = ::send(fd, buffer, length, MSG_DONTWAIT | MSG_NOSIGNAL);
+        if (sent == static_cast<ssize_t>(length)) return true;
+        if (sent > 0) {
+            buffer += sent;
+            length -= static_cast<unsigned>(sent);
+        } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
+            m_post_failure = -errno;
+            return true;  // reported by take_post_failure() with the reply
+        }
+    }
     IoCompletion* completion = Runtime::acquire_send_completion();
     /* Keep a socket's sends in order: chain this one behind its previous
     send when that is still the last SQE of this submission. */
@@ -240,6 +260,153 @@ bool SocketIo::enqueue(IoRequest& request) noexcept {
     if (follows_send) m_post_sqe = nullptr;
     Runtime::io_issued(&request.m_completion);
     return true;
+}
+
+namespace {
+thread_local std::uint16_t tls_next_buffer_group = 1;
+// The worker's free receivers (connections never leave their worker).
+thread_local MultishotReceiver* tls_free_receivers = nullptr;
+}  // namespace
+
+MultishotReceiver::MultishotReceiver() {
+    IoRing* ring = Runtime::current_ring();
+    if (ring == nullptr) detail::no_runtime();
+    m_group = tls_next_buffer_group++;
+    int error = 0;
+    m_ring = io_uring_setup_buf_ring(&ring->native_ring(), kBuffers, m_group, 0, &error);
+    if (m_ring == nullptr) throw std::system_error(-error, std::generic_category(), "io_uring_setup_buf_ring");
+    m_memory = static_cast<std::byte*>(mem::global_root().allocate(
+        static_cast<std::size_t>(kBuffers) * kBufferSize, 4096));
+    const int mask = io_uring_buf_ring_mask(kBuffers);
+    for (unsigned id = 0; id < kBuffers; ++id) {
+        io_uring_buf_ring_add(m_ring, m_memory + static_cast<std::size_t>(id) * kBufferSize,
+                              kBufferSize, static_cast<unsigned short>(id), mask, static_cast<int>(id));
+    }
+    io_uring_buf_ring_advance(m_ring, static_cast<int>(kBuffers));
+    m_completion.m_on_cqe = &MultishotReceiver::on_cqe;
+    m_completion.m_kind = WaitKind::Reply;
+}
+
+MultishotReceiver* MultishotReceiver::acquire(int fd) {
+    MultishotReceiver* receiver = tls_free_receivers;
+    if (receiver != nullptr) {
+        tls_free_receivers = receiver->m_next_free;
+        receiver->m_next_free = nullptr;
+    } else {
+        void* memory = mem::global_root().allocate(sizeof(MultishotReceiver), alignof(MultishotReceiver));
+        receiver = ::new (memory) MultishotReceiver();
+    }
+    receiver->m_fd = fd;
+    receiver->m_abandoned = false;
+    receiver->m_ended = false;
+    receiver->m_end_result = 0;
+    receiver->arm();
+    return receiver;
+}
+
+void MultishotReceiver::recycle() noexcept {
+    m_fd = -1;
+    m_first = 0;
+    m_count = 0;
+    m_partial_length = 0;
+    m_completion.m_task = nullptr;
+    m_completion.m_issued = 0;
+    m_next_free = tls_free_receivers;
+    tls_free_receivers = this;
+}
+
+void MultishotReceiver::abandon() noexcept {
+    /* Give back the buffers of arrivals nobody will read. */
+    if (m_partial_length != 0) {
+        release(m_partial_buffer);
+        m_partial_length = 0;
+    }
+    while (m_count != 0) {
+        const Raw raw = m_events[m_first];
+        m_first = (m_first + 1) % kEvents;
+        --m_count;
+        if ((raw.m_flags & IORING_CQE_F_BUFFER) != 0) release(raw.m_flags >> IORING_CQE_BUFFER_SHIFT);
+    }
+    m_completion.m_task = nullptr;
+    m_abandoned = true;
+    if (!m_armed) recycle();
+}
+
+void MultishotReceiver::arm() noexcept {
+    IoRing* ring = Runtime::current_ring();
+    if (!ring->submit_recv_multishot(m_fd, m_group, &m_completion)) return;
+    Runtime::io_issued(&m_completion);
+    m_armed = true;
+}
+
+detail::PromiseBase* MultishotReceiver::on_cqe(IoCompletion* completion, int result, unsigned flags) {
+    auto* self = reinterpret_cast<MultishotReceiver*>(
+        reinterpret_cast<std::byte*>(completion) - offsetof(MultishotReceiver, m_completion));
+    const bool more = (flags & IORING_CQE_F_MORE) != 0;
+    if (!more) self->m_armed = false;
+    if (self->m_abandoned) {
+        if ((flags & IORING_CQE_F_BUFFER) != 0) self->release(flags >> IORING_CQE_BUFFER_SHIFT);
+        if (!more) self->recycle();
+        return nullptr;
+    }
+    if (result == -ENOBUFS && (flags & IORING_CQE_F_BUFFER) == 0) {
+        /* The ring ran dry: nothing arrived; the reader re-arms. */
+    } else if (self->m_count < kEvents) {
+        self->m_events[(self->m_first + self->m_count) % kEvents] = Raw{result, flags};
+        ++self->m_count;
+    }
+    detail::PromiseBase* task = self->m_completion.m_task;
+    if (task == nullptr) return nullptr;
+    if (self->m_count == 0) {
+        if (!self->m_armed) self->arm();  // keep waiting on the re-armed receive
+        return nullptr;
+    }
+    self->m_completion.m_task = nullptr;
+    return task;
+}
+
+bool MultishotReceiver::ready() noexcept {
+    if (m_partial_length != 0 || m_count != 0 || m_ended) return true;
+    if (!m_armed) arm();
+    return false;
+}
+
+void MultishotReceiver::wait() noexcept {
+    m_completion.m_task = detail::tls_current;
+    Runtime::wait_started(&m_completion);
+}
+
+int MultishotReceiver::take(std::byte* destination, unsigned capacity) noexcept {
+    Runtime::wait_finished(&m_completion);
+    if (m_partial_length == 0) {
+        if (m_count == 0) return m_ended ? m_end_result : -EIO;
+        const Raw raw = m_events[m_first];
+        m_first = (m_first + 1) % kEvents;
+        --m_count;
+        if (raw.m_result <= 0 || (raw.m_flags & IORING_CQE_F_BUFFER) == 0) {
+            m_ended = true;
+            m_end_result = raw.m_result <= 0 ? raw.m_result : -EIO;
+            return m_end_result;
+        }
+        m_partial_buffer = raw.m_flags >> IORING_CQE_BUFFER_SHIFT;
+        m_partial_offset = 0;
+        m_partial_length = static_cast<unsigned>(raw.m_result);
+    }
+    const unsigned count = std::min(capacity, m_partial_length);
+    std::memcpy(destination,
+                m_memory + static_cast<std::size_t>(m_partial_buffer) * kBufferSize + m_partial_offset,
+                count);
+    m_partial_offset += count;
+    m_partial_length -= count;
+    if (m_partial_length == 0) release(m_partial_buffer);
+    return static_cast<int>(count);
+}
+
+void MultishotReceiver::release(unsigned buffer) noexcept {
+    io_uring_buf_ring_add(m_ring, m_memory + static_cast<std::size_t>(buffer) * kBufferSize,
+                          kBufferSize, static_cast<unsigned short>(buffer),
+                          io_uring_buf_ring_mask(kBuffers), 0);
+    io_uring_buf_ring_advance(m_ring, 1);
 }
 
 void SocketReadAwaiter::await_suspend(std::coroutine_handle<>) noexcept {

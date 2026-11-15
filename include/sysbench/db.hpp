@@ -45,15 +45,20 @@ struct Column {
     std::uint32_t m_charset = 0;
 };
 
+// One row's fields, as the wire parsers produce them (tests, tools).
 struct Row {
     mem::Vector<Field> m_fields;
     explicit Row(mem::MemoryResource& resource)
         : m_fields(mem::Allocator<Field>(&resource)) {}
 };
 
+/* A reply.  The rows are one flat array of fields, row after row (row i is
+m_fields[i * width(), (i + 1) * width())): one allocation for the whole
+reply, not one per row, and every element trivially destructible. */
 struct ResultSet {
     mem::Vector<Column> m_columns;
-    mem::Vector<Row> m_rows;
+    mem::Vector<Field> m_fields;
+    std::size_t m_row_count = 0;
     std::uint64_t m_affected_rows = 0;
     std::uint64_t m_last_insert_id = 0;
     std::uint16_t m_warnings = 0;
@@ -64,11 +69,33 @@ struct ResultSet {
 
     explicit ResultSet(mem::MemoryResource& resource)
         : m_columns(mem::Allocator<Column>(&resource)),
-          m_rows(mem::Allocator<Row>(&resource)) {}
+          m_fields(mem::Allocator<Field>(&resource)) {}
     ResultSet(ResultSet&&) noexcept = default;
     ResultSet& operator=(ResultSet&&) noexcept = default;
     ResultSet(const ResultSet&) = delete;
     ResultSet& operator=(const ResultSet&) = delete;
+
+    [[nodiscard]] std::size_t row_count() const noexcept { return m_row_count; }
+    [[nodiscard]] std::size_t width() const noexcept { return m_columns.size(); }
+    [[nodiscard]] std::span<const Field> row(std::size_t index) const noexcept {
+        const std::size_t columns = width();
+        return {m_fields.data() + index * columns, columns};
+    }
+    /* Empty it for the next reply, allocating from `resource` from now on.
+    The old storage goes back to its resource (a no-op for the arenas
+    results live in), so a reply allocates nothing it does not keep. */
+    void reset(mem::MemoryResource& resource) noexcept {
+        m_columns = mem::Vector<Column>(mem::Allocator<Column>(&resource));
+        m_fields = mem::Vector<Field>(mem::Allocator<Field>(&resource));
+        m_row_count = 0;
+        m_affected_rows = 0;
+        m_last_insert_id = 0;
+        m_warnings = 0;
+        m_status = 0;
+        m_has_rows = false;
+        m_more_results = false;
+        m_bytes_read = 0;
+    }
 };
 
 enum class BindKind : std::uint8_t { Null, Integer, Real, Bytes };
@@ -139,6 +166,9 @@ struct ConnectionOptions {
     std::string_view m_tls_ca;
     std::string_view m_tls_cert;
     std::string_view m_tls_key;
+    // Reconnect from other local ports until replies arrive on the NIC
+    // channel the connecting worker's CPU transmits on (see nic_queues.hpp).
+    bool m_steer_rx = false;
 };
 
 class Connection;
@@ -184,6 +214,31 @@ public:
         co_return Status::ok();
     }
     [[nodiscard]] virtual std::uint32_t pending_replies() const noexcept { return 0; }
+    // Synchronous requests (sysbench's blocking architecture): the
+    // request completes inside the call, with no coroutine, as with
+    // libmysqlclient.  Only while supports_sync() holds (blocking socket, no
+    // TLS, nothing pipelined); otherwise use the awaitable calls.
+    [[nodiscard]] virtual bool supports_sync() const noexcept { return false; }
+    /* Fill `out` (reset first) with the reply, allocating from `resource`.
+    False, with `error` set, when the query fails.  Neither the result nor
+    the error is returned by value, so a query moves and copies nothing. */
+    virtual bool query_into(std::string_view sql, ResultSet& out,
+                            mem::MemoryResource& resource, Error& error) {
+        (void)sql;
+        (void)out;
+        (void)resource;
+        error = Error("synchronous query unsupported", 2047);
+        return false;
+    }
+    QueryResult query_sync(std::string_view sql, mem::MemoryResource& result_resource) {
+        ResultSet out(result_resource);
+        Error error("");
+        if (!query_into(sql, out, result_resource, error)) return QueryResult::err(error);
+        return QueryResult::ok(std::move(out));
+    }
+    // The connection's socket (diagnostics: tools that drive the wire
+    // directly); -1 when there is none.
+    [[nodiscard]] virtual int native_socket() const noexcept { return -1; }
     virtual Task<Status> reconnect() = 0;
     virtual void close() noexcept = 0;
     [[nodiscard]] virtual bool healthy() const noexcept = 0;
@@ -207,7 +262,25 @@ public:
         if (result.is_err()) co_return Status::err(result.error());
         co_return Status::ok();
     }
+    // Synchronous execute (see Connection::supports_sync() and query_into()).
+    virtual bool execute_into(std::span<const BindValue> parameters, ResultSet& out,
+                              mem::MemoryResource& resource, Error& error) {
+        (void)parameters;
+        (void)out;
+        (void)resource;
+        error = Error("synchronous execute unsupported", 2047);
+        return false;
+    }
+    QueryResult execute_sync(std::span<const BindValue> parameters,
+                             mem::MemoryResource& result_resource) {
+        ResultSet out(result_resource);
+        Error error("");
+        if (!execute_into(parameters, out, result_resource, error)) return QueryResult::err(error);
+        return QueryResult::ok(std::move(out));
+    }
     virtual Task<Status> close() = 0;
+    // The server's statement id (diagnostics); 0 when there is none.
+    [[nodiscard]] virtual std::uint32_t native_id() const noexcept { return 0; }
     [[nodiscard]] virtual bool closed() const noexcept = 0;
     [[nodiscard]] virtual std::string_view sql() const noexcept = 0;
     virtual void destroy(mem::MemoryResource& resource) noexcept = 0;

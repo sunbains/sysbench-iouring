@@ -69,6 +69,18 @@ public:
         // the completion queue.  Either way the spin is the scheduler's, and
         // its length is learned from the waits the worker observes.
         bool m_busy_poll = false;
+        // Posted sends use zero-copy IORING_OP_SEND_ZC.
+        bool m_send_zc = false;
+        // Sockets receive through a multishot receive armed once (provided
+        // buffers) instead of one receive request per read.
+        bool m_multishot_receive = true;
+        // Sends with nothing in flight on their socket go out as a direct
+        // non-blocking send() instead of a ring request.
+        bool m_direct_send = false;
+        // sysbench's network architecture: blocking send() and recv()
+        // on blocking sockets (recv busy-polls through net.core.busy_read),
+        // one connection per worker.  A task never suspends on the network.
+        bool m_blocking_io = false;
     };
 
     Runtime() = default;
@@ -85,6 +97,9 @@ public:
     // from this point on and destroys it when it completes.
     void spawn(Task<void>&& task);
     void spawn_on(std::uint32_t worker, Task<void>&& task);
+    [[nodiscard]] bool multishot_receive() const noexcept { return m_config.m_multishot_receive; }
+    [[nodiscard]] bool busy_poll() const noexcept { return m_config.m_busy_poll; }
+    [[nodiscard]] bool blocking_io() const noexcept { return m_config.m_blocking_io; }
     // The calling worker's io_uring (nullptr off a worker thread).
     [[nodiscard]] static IoRing* current_ring() noexcept;
     // The calling worker has queued an SQE whose CQE carries `completion`.
@@ -92,6 +107,10 @@ public:
     // Completion records for sends nobody awaits, owned by the calling worker
     // (not by the connection), so a connection can close with sends in flight
     // without waiting: it orphans them and the reaper takes them back.
+    // A task starts / stops waiting on a request that was issued earlier
+    // (a multishot receive): the wait is timed like an awaited request.
+    static void wait_started(IoCompletion* completion) noexcept;
+    static void wait_finished(IoCompletion* completion) noexcept;
     [[nodiscard]] static IoCompletion* acquire_send_completion();
     static void release_send_completion(IoCompletion* completion) noexcept;
 

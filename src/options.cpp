@@ -72,6 +72,9 @@ Options::Options(mem::MemoryResource& resource) : m_resource(&resource) {
     add("mysql-socket", "MySQL Unix socket path", OptionType::String, "");
     add("mysql-ignore-errors", "MySQL error codes to ignore", OptionType::List,
         "1213,1205");
+    add("nic-steering",
+        "Reconnect each connection until its replies arrive on the NIC channel its worker's CPU transmits on (needs --pin-workers)",
+        OptionType::Bool, "off");
     add("mysql-ssl", "MySQL TLS mode: off, preferred, required",
         OptionType::String, "off");
     add("mysql-ssl-verify-server-cert", "Verify the MySQL TLS server certificate",
@@ -92,16 +95,24 @@ Options::Options(mem::MemoryResource& resource) : m_resource(&resource) {
         "Connections served by each worker when --workers is 0 (workers are capped at the CPU count)",
         OptionType::Int, "2");
     add("io-busy-poll",
-        "A waiting worker spins in the kernel polling the NIC (io_uring NAPI) instead of in user space; the spin length adapts to observed waits",
+        "on: a waiting worker spins in the kernel polling the NIC (io_uring NAPI); off: it spins in user space; auto: on when the host's net.core.busy_read is set (as every blocking recv() then busy-polls). The spin length adapts to observed waits",
+        OptionType::String, "off");
+    add("io-send-zc", "Send with zero-copy IORING_OP_SEND_ZC", OptionType::Bool, "off");
+    add("io-multishot-recv", "Receive through one multishot receive per connection (provided buffers)",
+        OptionType::Bool, "on");
+    add("io-direct-send", "Send with a direct non-blocking send() when nothing is in flight on the socket",
         OptionType::Bool, "off");
+    add("io-blocking",
+        "sysbench's network architecture: blocking send()/recv() (recv busy-polls via net.core.busy_read), one connection per worker; off: the per-worker io_uring path",
+        OptionType::Bool, "on");
     add("numa", "Enable NUMA-aware placement and node-local memory",
         OptionType::Bool, "on");
     add("pin-workers", "Pin worker threads to their assigned CPUs",
         OptionType::Bool, "on");
     add("lua-heap-size", "Lua heap of each connection (script state, event results)",
         OptionType::Size, "1M");
-    add("connection-heap-size", "Heap of each connection's MySQL session state",
-        OptionType::Size, "1K");
+    add("connection-heap-size", "Heap of each connection's MySQL session state and prepared statements",
+        OptionType::Size, "8K");
     add("stall-timeout",
         "Report a stalled connection after N seconds without progress "
         "(0 = wait forever)",

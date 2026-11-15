@@ -16,6 +16,9 @@
 
 #pragma once
 
+#include <cstdlib>
+#include <string_view>
+
 // io_uring transport primitives.  Each runtime worker owns one ring, created
 // on the worker's thread (single issuer, deferred task work): only that worker
 // submits to it and reaps it.  Socket buffers are thread-affine and pooled.
@@ -59,6 +62,10 @@ struct IoCompletion {
     // A worker-owned send completion whose connection has gone: the reaper
     // returns it to the worker's pool when its CQE arrives.
     bool m_orphan = false;
+    // Requests that post many CQEs (multishot): the reaper hands each CQE to
+    // this handler, which returns the task to resume (or nullptr).  The
+    // request stays in flight while the CQE carries IORING_CQE_F_MORE.
+    detail::PromiseBase* (*m_on_cqe)(IoCompletion*, int result, unsigned flags) = nullptr;
 };
 
 class IoRing {
@@ -85,7 +92,7 @@ public:
     // Submit, then block until at least one CQE is ready or `timeout` passes.
     // With NAPI busy polling enabled the kernel first polls the NIC queues of
     // this ring's sockets from the waiting thread.
-    void submit_and_wait(__kernel_timespec* timeout) noexcept;
+    void submit_and_wait(__kernel_timespec* timeout, unsigned wait_nr = 1) noexcept;
     // Busy-poll the NIC (NAPI) for up to `busy_poll_us` while waiting for
     // completions, as a blocking recv() does with net.core.busy_read: the
     // reply is then processed by the TCP stack on this thread's CPU instead of
@@ -93,6 +100,8 @@ public:
     // stay in this CPU's cache.  False if the kernel lacks it.
     bool enable_napi(unsigned busy_poll_us) noexcept;
     [[nodiscard]] bool napi_enabled() const noexcept { return m_napi; }
+    // Static NAPI tracking (6.13+): poll exactly the ids added, instead of
+    // tracking sockets as polls are armed.  Set before enable_napi().
     // SQEs prepared and not yet submitted.
     [[nodiscard]] unsigned queued() const noexcept { return m_queued; }
     // Number of submissions so far: an SQE prepared after the last one is
@@ -147,6 +156,28 @@ public:
     // CQE only marks the completion done (the buffer is free again).
     bool submit_send_posted(int fd, const void* buffer, unsigned length,
                             IoCompletion* completion) noexcept;
+    // Registered (fixed) sockets: sends and receives on them name the file
+    // by slot (IOSQE_FIXED_FILE) and skip the fd lookup and its reference
+    // count on every request.  Returns the slot or -1.
+    int register_socket(int fd) noexcept;
+    void unregister_socket(int fd) noexcept;
+    void use_fixed_file(io_uring_sqe* sqe, int fd) const noexcept {
+        if (static_cast<unsigned>(fd) < kMaxFixedFds && m_fixed_slot[fd] >= 0) {
+            sqe->fd = m_fixed_slot[fd];
+            sqe->flags |= IOSQE_FIXED_FILE;
+        }
+    }
+    // A multishot receive selecting buffers from provided-buffer group
+    // `group`: armed once, one CQE per arrival.
+    bool submit_recv_multishot(int fd, std::uint16_t group, IoCompletion* completion) noexcept;
+    // Posted sends as IORING_OP_SEND_ZC: the kernel transmits from the
+    // buffer itself and posts a second CQE (IORING_CQE_F_NOTIF) once it no
+    // longer needs it; the send counts as done only then.
+    void set_send_zc(bool enabled) noexcept { m_send_zc = enabled; }
+    // Small sends go out as a direct non-blocking send() when nothing of the
+    // socket's is in flight (see SocketIo::post_send).
+    void set_direct_send(bool enabled) noexcept { m_direct_send = enabled; }
+    [[nodiscard]] bool direct_send() const noexcept { return m_direct_send; }
     int flush_submit() noexcept;
 
     [[nodiscard]] io_uring_cqe* peek_completion() noexcept;
@@ -175,6 +206,27 @@ private:
     int m_last_error = 0;
     bool m_initialized = false;
     bool m_napi = false;
+    bool m_send_zc = false;
+    bool m_direct_send = false;
+    static constexpr unsigned kMaxFixedFds = 4096;
+    static constexpr unsigned kMaxFixedSlots = 256;
+    bool m_files_registered = false;
+    std::array<std::int16_t, kMaxFixedFds> m_fixed_slot = make_filled<kMaxFixedFds>();
+    std::array<int, kMaxFixedSlots> m_slot_fd = make_filled_int<kMaxFixedSlots>();
+    template <std::size_t N>
+    static constexpr std::array<std::int16_t, N> make_filled() {
+        std::array<std::int16_t, N> a{};
+        for (auto& v : a) v = -1;
+        return a;
+    }
+    template <std::size_t N>
+    static constexpr std::array<int, N> make_filled_int() {
+        std::array<int, N> a{};
+        for (auto& v : a) v = -1;
+        return a;
+    }
+    // A kernel thread consumes the SQ: submitting is a store, no syscall.
+    bool m_sqpoll = false;
 
     friend class RegisteredBufferPool;
 };

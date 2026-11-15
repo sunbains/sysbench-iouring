@@ -1,5 +1,5 @@
-# LuaJIT, vendored from stock sysbench (third_party/luajit, LuaJIT 2.1.0-beta3)
-# and linked statically, as stock sysbench does.
+# LuaJIT, vendored from sysbench (third_party/luajit, LuaJIT 2.1.0-beta3)
+# and linked statically.
 #
 # LuaJIT's make builds in place, so the sources are copied into the build tree
 # and built there: the source tree stays clean.

@@ -175,15 +175,23 @@ HeapArena::~HeapArena() {
     }
 }
 
+// Block sizes are multiples of 16 below 4 GiB.
 std::uint32_t HeapArena::bin_for(std::size_t bytes) noexcept {
-    if (bytes <= kMinBlock) return 0;
-    unsigned int log = 0;
-    std::size_t value = bytes - 1;
-    while (value != 0) {
-        value >>= 1;
-        ++log;
-    }
-    return std::min<std::uint32_t>(log - 5, kBinCount - 1);
+    if (bytes < kSmallLimit) return static_cast<std::uint32_t>(bytes >> 4);
+    const unsigned level = 63u - static_cast<unsigned>(__builtin_clzll(bytes));
+    const auto sub = static_cast<std::uint32_t>((bytes >> (level - kSubBinBits)) &
+                                                ((1u << kSubBinBits) - 1));
+    const std::uint32_t bin =
+        static_cast<std::uint32_t>(kSmallBins) + ((level - 10) << kSubBinBits) + sub;
+    return std::min<std::uint32_t>(bin, kBinCount - 1);
+}
+
+std::uint32_t HeapArena::search_bin(std::size_t bytes) noexcept {
+    if (bytes < kSmallLimit) return static_cast<std::uint32_t>(bytes >> 4);
+    const unsigned level = 63u - static_cast<unsigned>(__builtin_clzll(bytes));
+    const std::size_t rounded = bytes + (std::size_t{1} << (level - kSubBinBits)) - 1;
+    if (rounded >> 32 != 0) return static_cast<std::uint32_t>(kBinCount);
+    return bin_for(rounded);
 }
 
 HeapArena::Block* HeapArena::block_of(void* ptr) const noexcept {
@@ -199,16 +207,21 @@ void HeapArena::insert_free(Block* block) noexcept {
     block->m_bin = bin;
     block->m_is_free = 1;
     block->m_prev_free = nullptr;
-    block->m_next_free = m_bins[bin];
-    if (m_bins[bin] != nullptr) m_bins[bin]->m_prev_free = block;
-    m_bins[bin] = block;
+    Block* first = head(bin);
+    block->m_next_free = first;
+    if (first != nullptr) first->m_prev_free = block;
+    set_head(bin, block);
+    m_bin_map[bin / 64] |= std::uint64_t{1} << (bin % 64);
 }
 
 void HeapArena::remove_free(Block* block) noexcept {
     if (block->m_prev_free != nullptr) {
         block->m_prev_free->m_next_free = block->m_next_free;
     } else {
-        m_bins[block->m_bin] = block->m_next_free;
+        set_head(block->m_bin, block->m_next_free);
+        if (block->m_next_free == nullptr) {
+            m_bin_map[block->m_bin / 64] &= ~(std::uint64_t{1} << (block->m_bin % 64));
+        }
     }
     if (block->m_next_free != nullptr) block->m_next_free->m_prev_free = block->m_prev_free;
     block->m_next_free = nullptr;
@@ -216,14 +229,21 @@ void HeapArena::remove_free(Block* block) noexcept {
     block->m_is_free = 0;
 }
 
+/* First the bins whose every block fits (a bitmap search, O(1)).  Only when
+they are all empty, the request's own bin, whose blocks may or may not fit:
+a nearly full heap then still finds the block a size-ordered search would. */
 HeapArena::Block* HeapArena::find_fit(std::size_t wanted) noexcept {
-    const std::uint32_t first = bin_for(wanted);
-    for (std::uint32_t bin = first; bin < kBinCount; ++bin) {
-        Block* block = m_bins[bin];
-        while (block != nullptr) {
-            if (block->m_size >= wanted) return block;
-            block = block->m_next_free;
+    const std::uint32_t first = search_bin(wanted);
+    if (first < kBinCount) {
+        std::size_t word = first / 64;
+        std::uint64_t bits = m_bin_map[word] & (~std::uint64_t{0} << (first % 64));
+        while (bits == 0 && ++word < std::size(m_bin_map)) bits = m_bin_map[word];
+        if (bits != 0) {
+            return head(word * 64 + static_cast<std::size_t>(__builtin_ctzll(bits)));
         }
+    }
+    for (Block* block = head(bin_for(wanted)); block != nullptr; block = block->m_next_free) {
+        if (block->m_size >= wanted) return block;
     }
     return nullptr;
 }
@@ -369,6 +389,7 @@ ResourceStats HeapArena::stats() const noexcept {
 
 void HeapArena::reset() noexcept {
     std::memset(m_bins, 0, sizeof(m_bins));
+    std::memset(m_bin_map, 0, sizeof(m_bin_map));
     auto* initial = reinterpret_cast<Block*>(m_base);
     initial->m_size = saturating_u32(m_capacity);
     initial->m_prev_size = 0;

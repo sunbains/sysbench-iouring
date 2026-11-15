@@ -47,6 +47,9 @@ IoRing::IoRing(unsigned entries, unsigned setup_flags) : m_entries(entries) {
 
     io_uring_params params{};
     params.flags = setup_flags;
+    if ((setup_flags & IORING_SETUP_SQPOLL) != 0) {
+        params.sq_thread_idle = 2000;
+    }
     int result = io_uring_queue_init_params(entries, &m_ring, &params);
     if (result == -EINVAL && (setup_flags & IORING_SETUP_DEFER_TASKRUN) != 0) {
         params = io_uring_params{};
@@ -59,6 +62,10 @@ IoRing::IoRing(unsigned entries, unsigned setup_flags) : m_entries(entries) {
                                 "io_uring_queue_init_params");
     }
     m_initialized = true;
+    m_sqpoll = (params.flags & IORING_SETUP_SQPOLL) != 0;
+    /* Registered ring fd: io_uring_enter then names the ring by index and
+    skips looking up (and reference counting) its file on every call. */
+    (void)io_uring_register_ring_fd(&m_ring);
 }
 
 IoRing::~IoRing() {
@@ -147,6 +154,7 @@ bool IoRing::submit_recv(int fd, void* buffer, unsigned length, int flags,
     io_uring_sqe* sqe = acquire_sqe(completion);
     if (sqe == nullptr) return false;
     io_uring_prep_recv(sqe, fd, buffer, length, flags);
+    use_fixed_file(sqe, fd);
     return true;
 }
 
@@ -155,6 +163,7 @@ bool IoRing::submit_send(int fd, const void* buffer, unsigned length, int flags,
     io_uring_sqe* sqe = acquire_sqe(completion);
     if (sqe == nullptr) return false;
     io_uring_prep_send(sqe, fd, buffer, length, flags);
+    use_fixed_file(sqe, fd);
     return true;
 }
 
@@ -169,15 +178,61 @@ bool IoRing::submit_send_posted(int fd, const void* buffer, unsigned length,
                                 IoCompletion* completion) noexcept {
     io_uring_sqe* sqe = acquire_sqe(completion);
     if (sqe == nullptr) return false;
-    io_uring_prep_send(sqe, fd, buffer, length, MSG_WAITALL | MSG_NOSIGNAL);
+    if (m_send_zc) {
+        io_uring_prep_send_zc(sqe, fd, buffer, length, MSG_WAITALL | MSG_NOSIGNAL, 0);
+        use_fixed_file(sqe, fd);
+    } else {
+        io_uring_prep_send(sqe, fd, buffer, length, MSG_WAITALL | MSG_NOSIGNAL);
+        use_fixed_file(sqe, fd);
+    }
     return true;
+}
+
+bool IoRing::submit_recv_multishot(int fd, std::uint16_t group, IoCompletion* completion) noexcept {
+    io_uring_sqe* sqe = acquire_sqe(completion);
+    if (sqe == nullptr) return false;
+    io_uring_prep_recv_multishot(sqe, fd, nullptr, 0, 0);
+    use_fixed_file(sqe, fd);
+    sqe->flags |= IOSQE_BUFFER_SELECT;
+    sqe->buf_group = group;
+    return true;
+}
+
+int IoRing::register_socket(int fd) noexcept {
+    if (fd < 0 || static_cast<unsigned>(fd) >= kMaxFixedFds) return -1;
+    if (!m_files_registered) {
+        if (io_uring_register_files_sparse(&m_ring, kMaxFixedSlots) < 0) return -1;
+        m_files_registered = true;
+    }
+    if (m_fixed_slot[fd] >= 0) return m_fixed_slot[fd];
+    for (unsigned slot = 0; slot < kMaxFixedSlots; ++slot) {
+        if (m_slot_fd[slot] < 0) {
+            if (io_uring_register_files_update(&m_ring, slot, &fd, 1) != 1) return -1;
+            m_slot_fd[slot] = fd;
+            m_fixed_slot[fd] = static_cast<std::int16_t>(slot);
+            return static_cast<int>(slot);
+        }
+    }
+    return -1;
+}
+
+void IoRing::unregister_socket(int fd) noexcept {
+    if (fd < 0 || static_cast<unsigned>(fd) >= kMaxFixedFds || m_fixed_slot[fd] < 0) return;
+    const int slot = m_fixed_slot[fd];
+    int none = -1;
+    (void)io_uring_register_files_update(&m_ring, static_cast<unsigned>(slot), &none, 1);
+    m_slot_fd[slot] = -1;
+    m_fixed_slot[fd] = -1;
 }
 
 void IoRing::submit_and_collect() noexcept {
     SB_LAYER(KernelSubmit);
     SB_COUNT(SubmitCalls, 1);
     const unsigned queued = m_queued;
-    const int result = io_uring_submit_and_get_events(&m_ring);
+    /* With SQPOLL the kernel thread takes the SQEs and posts the CQEs:
+    publishing the SQ tail is the whole submission (liburing enters only to
+    wake an idle poll thread). */
+    const int result = m_sqpoll ? io_uring_submit(&m_ring) : io_uring_submit_and_get_events(&m_ring);
     if (result < 0) {
         m_last_error = -result;
         return;
@@ -189,12 +244,12 @@ void IoRing::submit_and_collect() noexcept {
     }
 }
 
-void IoRing::submit_and_wait(__kernel_timespec* timeout) noexcept {
+void IoRing::submit_and_wait(__kernel_timespec* timeout, unsigned wait_nr) noexcept {
     SB_LAYER(KernelWait);
     SB_COUNT(WaitCalls, 1);
     const unsigned queued = m_queued;
     io_uring_cqe* cqe = nullptr;
-    const int result = io_uring_submit_and_wait_timeout(&m_ring, &cqe, 1, timeout, nullptr);
+    const int result = io_uring_submit_and_wait_timeout(&m_ring, &cqe, wait_nr, timeout, nullptr);
     if (queued != 0) {
         ++m_submit_epoch;
         m_queued = 0;

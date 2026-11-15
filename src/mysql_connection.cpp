@@ -22,12 +22,14 @@
 #include "sysbench/runtime.hpp"
 #include "sysbench/socket_io.hpp"
 #include "sysbench/layer_stats.hpp"
+#include "sysbench/nic_queues.hpp"
 #include "sysbench/task.hpp"
 #include "mysql_transport.hpp"
 
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <fcntl.h>
 #include <netinet/tcp.h>
 #include <openssl/err.h>
 #include <openssl/ssl.h>
@@ -103,6 +105,7 @@ public:
             }
             m_fd = fd;
             m_healthy = true;
+            start_receiving();
             co_return;
         }
 
@@ -152,6 +155,82 @@ public:
         ::freeaddrinfo(addresses);
         if (!connected) throw_network("connect", 2003, last_error);
         m_healthy = true;
+        start_receiving();
+    }
+
+    /* Every read of the socket goes through one multishot receive armed here
+    (when enabled): a second, ordinary receive on the same socket would split
+    the stream unpredictably. */
+    void start_receiving() {
+        Runtime* runtime = Runtime::current();
+        /* Blocking architecture: the socket becomes blocking; sends are plain
+        send() calls (SocketIo's direct send) and receives plain recv()s that
+        busy-poll in the kernel, as libmysqlclient's do. */
+        if (runtime != nullptr && runtime->blocking_io()) {
+            const int flags = ::fcntl(m_fd, F_GETFL);
+            if (flags >= 0) (void)::fcntl(m_fd, F_SETFL, flags & ~O_NONBLOCK);
+            m_blocking = true;
+            return;
+        }
+        /* With io_uring NAPI busy polling the worker's wait polls the NIC;
+        the socket's own busy-poll (inherited from net.core.busy_read) would
+        add a NIC poll pass to every receive attempt io_uring makes. */
+        if (runtime != nullptr && runtime->busy_poll()) {
+            int zero = 0;
+            (void)::setsockopt(m_fd, SOL_SOCKET, SO_BUSY_POLL, &zero, sizeof(zero));
+        }
+        if (runtime != nullptr && runtime->multishot_receive()) {
+            m_receiver = MultishotReceiver::acquire(m_fd);
+        }
+    }
+
+    // Receive into `destination`: through the multishot receiver, or one
+    // fixed-buffer receive request.  An awaiter: no coroutine frame.
+    class ReceiveAwaiter {
+    public:
+        ReceiveAwaiter(PacketChannel& channel, std::byte* destination, unsigned capacity)
+            : m_receiver(channel.m_receiver),
+              m_destination(destination),
+              m_capacity(capacity),
+              m_blocking_fd(channel.m_blocking ? channel.m_fd : -1),
+              m_read(channel.m_io, channel.m_fd, destination, capacity, channel.m_read_buffer.index()) {}
+        [[nodiscard]] bool await_ready() noexcept {
+            if (m_blocking_fd >= 0) {
+                /* Blocking recv() right here: the worker waits in the kernel
+                (busy-polling the NIC) and the task never suspends. */
+                ssize_t received;
+                do {
+                    received = ::recv(m_blocking_fd, m_destination, m_capacity, 0);
+                } while (received < 0 && errno == EINTR);
+                m_blocking_result = received < 0 ? -errno : static_cast<int>(received);
+                return true;
+            }
+            return m_receiver != nullptr && m_receiver->ready();
+        }
+        void await_suspend(std::coroutine_handle<> handle) noexcept {
+            if (m_receiver != nullptr) {
+                m_receiver->wait();
+            } else {
+                m_read.await_suspend(handle);
+            }
+        }
+        int await_resume() noexcept {
+            if (m_blocking_fd >= 0) return m_blocking_result;
+            return m_receiver != nullptr ? m_receiver->take(m_destination, m_capacity)
+                                         : m_read.await_resume();
+        }
+
+    private:
+        MultishotReceiver* m_receiver;
+        std::byte* m_destination;
+        unsigned m_capacity;
+        int m_blocking_fd;
+        int m_blocking_result = 0;
+        SocketReadAwaiter m_read;
+    };
+    [[nodiscard]] ReceiveAwaiter receive(void* destination, std::size_t capacity) {
+        return ReceiveAwaiter(*this, static_cast<std::byte*>(destination),
+                              static_cast<unsigned>(capacity));
     }
 
     [[nodiscard]] bool tls_active() const noexcept { return m_tls_active; }
@@ -331,6 +410,10 @@ public:
         }
     }
 
+    [[nodiscard]] int fd() const noexcept { return m_fd; }
+    // Wait (via the scheduler) until every send of this connection is done.
+    Task<void> flush_sends() { co_await drain_posted(); }
+
     // Every posted send of this connection is done.
     Task<void> drain_posted() {
         while (IoCompletion* oldest = m_io.oldest_posted()) {
@@ -468,6 +551,63 @@ public:
         return true;
     }
 
+    // ---- Synchronous I/O (blocking architecture) ---------------------------
+    // Requests complete in the call, as libmysqlclient's do: no coroutine.
+
+    [[nodiscard]] bool synchronous() const noexcept {
+        return m_blocking && !m_tls_active && m_healthy;
+    }
+
+    void send_command_sync(std::uint8_t command, std::span<const std::byte> body) {
+        if (try_send_command(command, body)) return;  // framed and sent (direct send)
+        const std::size_t total = 1 + body.size();
+        if (total >= 0x00ffffff) {
+            throw db::Error("MySQL commands of 16 MiB or more are unsupported here", 2020);
+        }
+        const std::array<std::byte, 5> head{
+            static_cast<std::byte>(total & 0xff), static_cast<std::byte>((total >> 8) & 0xff),
+            static_cast<std::byte>((total >> 16) & 0xff), std::byte{0},
+            static_cast<std::byte>(command)};
+        send_all(head.data(), head.size());
+        send_all(body.data(), body.size());
+        m_sequence = 1;
+    }
+
+    // The next reply packet: a view into the read buffer (valid until the next
+    // read), or, for a packet larger than the buffer, a copy in `resource`.
+    std::span<const std::byte> next_packet_sync(mem::MemoryResource& resource) {
+        for (;;) {
+            std::span<const std::byte> packet;
+            if (try_read_packet_view(packet)) return packet;
+            if (packet_needs_coroutine()) return read_large_packet_sync(resource);
+            refill_sync();
+        }
+    }
+
+    // Like try_read_packet(), but the packet stays in the read buffer: no
+    // copy, no allocation.  The view is valid until the next read (only a
+    // refill moves the buffer's bytes), so it is for packets parsed at once.
+    [[nodiscard]] bool try_read_packet_view(std::span<const std::byte>& packet) {
+        SB_LAYER(Protocol);
+        if (m_tls_active || m_read_available < 4) return false;
+        const auto* at = static_cast<const std::byte*>(m_read_buffer.data()) + m_read_position;
+        const std::size_t length = std::to_integer<std::size_t>(at[0]) |
+                                   (std::to_integer<std::size_t>(at[1]) << 8) |
+                                   (std::to_integer<std::size_t>(at[2]) << 16);
+        if (m_read_available < 4 + length) return false;
+        if (std::to_integer<std::uint8_t>(at[3]) != m_sequence) {
+            throw db::Error("unexpected MySQL packet sequence", 2027);
+        }
+        if (length == 0x00ffffff) {
+            throw db::Error("MySQL packets larger than 16 MiB are unsupported", 2027);
+        }
+        ++m_sequence;
+        packet = std::span<const std::byte>(at + 4, length);
+        m_read_position += 4 + length;
+        m_read_available -= 4 + length;
+        return true;
+    }
+
     // The next packet cannot come through try_read_packet()/refill(): TLS, or
     // a packet larger than the read buffer.
     [[nodiscard]] bool packet_needs_coroutine() const noexcept {
@@ -486,16 +626,16 @@ public:
     public:
         explicit RefillAwaiter(PacketChannel& channel)
             : m_channel(&channel),
-              m_read(channel.m_io, channel.m_fd, channel.refill_target(),
-                     static_cast<unsigned>(channel.m_read_buffer.size() - channel.m_read_available),
-                     channel.m_read_buffer.index()) {}
-        [[nodiscard]] bool await_ready() const noexcept { return false; }
+              m_read(channel, channel.refill_target(),
+                     static_cast<unsigned>(channel.m_read_buffer.size() -
+                                           channel.m_read_available)) {}
+        [[nodiscard]] bool await_ready() noexcept { return m_read.await_ready(); }
         void await_suspend(std::coroutine_handle<> handle) noexcept { m_read.await_suspend(handle); }
         void await_resume() { m_channel->refilled(m_read.await_resume()); }
 
     private:
         PacketChannel* m_channel;
-        SocketReadAwaiter m_read;
+        ReceiveAwaiter m_read;
     };
     [[nodiscard]] RefillAwaiter refill() { return RefillAwaiter(*this); }
 
@@ -532,8 +672,7 @@ public:
             co_return count;
         }
         if (m_read_available == 0) {
-            const int received = co_await read_fixed(
-                m_io, m_fd, m_read_buffer.data(), m_read_buffer.size(), m_read_buffer.index());
+            const int received = co_await receive(m_read_buffer.data(), m_read_buffer.size());
             if (received <= 0) {
                 close();
                 if (received < 0) throw_network("read", 2013, -received);
@@ -560,8 +699,14 @@ public:
     }
 
     void close() noexcept override {
-        /* No waiting: sends still in flight are orphaned to the worker. */
+        /* No waiting: sends still in flight are orphaned to the worker, and
+        the receiver goes back to it once the shutdown below ends its
+        multishot receive. */
         m_io.abandon_posted();
+        if (m_receiver != nullptr) {
+            m_receiver->abandon();
+            m_receiver = nullptr;
+        }
         close_tls();
         m_read_available = 0;
         m_read_position = 0;
@@ -579,6 +724,62 @@ public:
     [[nodiscard]] bool healthy() const noexcept override { return m_healthy && m_fd >= 0; }
 
 private:
+    void send_all(const std::byte* data, std::size_t count) {
+        while (count > 0) {
+            const ssize_t sent = ::send(m_fd, data, count, MSG_NOSIGNAL);
+            if (sent < 0) {
+                if (errno == EINTR) continue;
+                const int error = errno;
+                close();
+                throw_network("write", 2013, error);
+            }
+            data += sent;
+            count -= static_cast<std::size_t>(sent);
+        }
+    }
+
+    void refill_sync() {
+        std::byte* target = refill_target();
+        const std::size_t room = m_read_buffer.size() - m_read_available;
+        ssize_t received;
+        do {
+            received = ::recv(m_fd, target, room, 0);
+        } while (received < 0 && errno == EINTR);
+        refilled(received < 0 ? -errno : static_cast<int>(received));
+    }
+
+    std::span<const std::byte> read_large_packet_sync(mem::MemoryResource& resource) {
+        const auto* at = static_cast<const std::byte*>(m_read_buffer.data()) + m_read_position;
+        const std::size_t length = std::to_integer<std::size_t>(at[0]) |
+                                   (std::to_integer<std::size_t>(at[1]) << 8) |
+                                   (std::to_integer<std::size_t>(at[2]) << 16);
+        if (std::to_integer<std::uint8_t>(at[3]) != m_sequence) {
+            throw db::Error("unexpected MySQL packet sequence", 2027);
+        }
+        if (length == 0x00ffffff) {
+            throw db::Error("MySQL packets larger than 16 MiB are unsupported", 2027);
+        }
+        ++m_sequence;
+        auto* memory = static_cast<std::byte*>(resource.allocate(length, 1));
+        std::size_t got = m_read_available - 4;
+        std::memcpy(memory, at + 4, got);
+        m_read_position = 0;
+        m_read_available = 0;
+        while (got < length) {
+            const ssize_t received = ::recv(m_fd, memory + got, length - got, 0);
+            if (received > 0) {
+                got += static_cast<std::size_t>(received);
+                continue;
+            }
+            if (received < 0 && errno == EINTR) continue;
+            const int error = received < 0 ? errno : 0;
+            close();
+            if (error != 0) throw_network("read", 2013, error);
+            throw db::Error("MySQL server closed the connection", 2013);
+        }
+        return std::span<const std::byte>(memory, length);
+    }
+
     // Where a refill receives into: after the unread bytes, moved to the front.
     std::byte* refill_target() noexcept {
         auto* base = static_cast<std::byte*>(m_read_buffer.data());
@@ -621,9 +822,7 @@ private:
         }
         while (count > 0) {
             if (m_read_available == 0) {
-                const int received = co_await read_fixed(
-                    m_io, m_fd, m_read_buffer.data(), m_read_buffer.size(),
-                    m_read_buffer.index());
+                const int received = co_await receive(m_read_buffer.data(), m_read_buffer.size());
                 if (const int failed = m_io.take_post_failure(); failed < 0) {
                     close();
                     throw write_failure(failed);
@@ -745,8 +944,7 @@ private:
 
     Task<void> feed_tls_rbio() {
         const int received =
-            co_await read_fixed(m_io, m_fd, m_read_buffer.data(),
-                                m_read_buffer.size(), m_read_buffer.index());
+            co_await receive(m_read_buffer.data(), m_read_buffer.size());
         if (received <= 0) {
             close();
             if (received < 0) throw_network("read(tls)", 2013, -received);
@@ -806,6 +1004,8 @@ private:
     }
 
     SocketIo m_io;
+    MultishotReceiver* m_receiver = nullptr;
+    bool m_blocking = false;
     RegisteredBufferLease m_read_buffer;
     RegisteredBufferLease m_write_buffer;
     int m_fd = -1;
@@ -829,6 +1029,19 @@ bytes are in (or arrive into) the read buffer; see PacketChannel's hot path. */
 #define SB_NEXT_PACKET(channel, resource, out)                   \
     for (;;) {                                                    \
         if ((channel).try_read_packet((resource), (out))) break;  \
+        if ((channel).packet_needs_coroutine()) {                 \
+            (out) = co_await (channel).read_packet(resource);     \
+            break;                                                \
+        }                                                         \
+        co_await (channel).refill();                              \
+    }
+
+// The next packet as a view into the read buffer (see try_read_packet_view):
+// for packets parsed before the next read.  Packets too big for the buffer,
+// or TLS, still come through the copying coroutine path.
+#define SB_NEXT_PACKET_VIEW(channel, resource, out)              \
+    for (;;) {                                                    \
+        if ((channel).try_read_packet_view(out)) break;           \
         if ((channel).packet_needs_coroutine()) {                 \
             (out) = co_await (channel).read_packet(resource);     \
             break;                                                \
@@ -862,7 +1075,8 @@ struct OwnedOptions {
           m_connect_timeout_ms(source.m_connect_timeout_ms),
           m_max_packet_size(source.m_max_packet_size),
           m_tls_mode(source.m_tls_mode),
-          m_tls_verify_server_cert(source.m_tls_verify_server_cert) {
+          m_tls_verify_server_cert(source.m_tls_verify_server_cert),
+          m_steer_rx(source.m_steer_rx) {
         m_host.assign(source.m_host);
         m_port.assign(source.m_port);
         m_user.assign(source.m_user);
@@ -888,13 +1102,15 @@ struct OwnedOptions {
             .m_tls_verify_server_cert = m_tls_verify_server_cert,
             .m_tls_ca = m_tls_ca,
             .m_tls_cert = m_tls_cert,
-            .m_tls_key = m_tls_key};
+            .m_tls_key = m_tls_key,
+            .m_steer_rx = m_steer_rx};
     }
 
     std::uint32_t m_connect_timeout_ms;
     std::uint32_t m_max_packet_size;
     db::TlsMode m_tls_mode;
     bool m_tls_verify_server_cert;
+    bool m_steer_rx;
 };
 
 class MysqlStatement final : public db::PreparedStatement {
@@ -907,6 +1123,8 @@ public:
                                   mem::MemoryResource& result_resource) override;
     Task<db::Status> send_execute(std::span<const db::BindValue> parameters,
                                   mem::MemoryResource& scratch) override;
+    bool execute_into(std::span<const db::BindValue> parameters, db::ResultSet& out,
+                      mem::MemoryResource& resource, db::Error& error) override;
     Task<db::Status> close() override;
     Task<db::ResultSet> execute_impl(std::span<const db::BindValue> parameters,
                                      mem::MemoryResource& result_resource);
@@ -914,6 +1132,23 @@ public:
     [[nodiscard]] bool closed() const noexcept override { return m_closed; }
     [[nodiscard]] std::string_view sql() const noexcept override { return m_sql; }
     [[nodiscard]] std::uint32_t id() const noexcept { return m_id; }
+    // Whether this execute must send the parameter types: on the first
+    // execute and whenever a type differs from the ones the server holds.
+    [[nodiscard]] bool types_changed(std::span<const db::BindValue> parameters) noexcept {
+        const std::size_t count = std::min(parameters.size(), m_bound_types.size());
+        bool same = m_types_bound && parameters.size() == m_bound_count;
+        for (std::size_t i = 0; i < count; ++i) {
+            const auto kind = static_cast<std::uint8_t>(parameters[i].m_kind);
+            if (same && m_bound_types[i] != kind) same = false;
+            m_bound_types[i] = kind;
+        }
+        m_bound_count = parameters.size();
+        m_types_bound = true;
+        return !same;
+    }
+    [[nodiscard]] std::uint32_t native_id() const noexcept override {
+        return m_text_mode ? 0 : m_id;
+    }
     [[nodiscard]] std::uint16_t parameter_count() const noexcept { return m_parameters; }
 
     void destroy(mem::MemoryResource& resource) noexcept override {
@@ -929,6 +1164,10 @@ private:
     std::uint16_t m_parameters = 0;
     bool m_closed = false;
     bool m_text_mode = false;
+    // Parameter types the server holds for this statement.
+    std::array<std::uint8_t, 64> m_bound_types{};
+    std::size_t m_bound_count = 0;
+    bool m_types_bound = false;
 };
 
 class MysqlConnection final : public db::Connection {
@@ -945,9 +1184,33 @@ public:
 
     ~MysqlConnection() override { close(); }
 
+    /* With m_steer_rx, the connection is re-made from another local port
+    until RSS delivers its replies to the channel this worker's CPU transmits
+    on: send, TX completion, receive and the read then all stay on the
+    worker's CPU.  The port decides the channel, so each attempt is a full
+    login and a COM_QUIT (a clean disconnect for the server, never a
+    connection error).  RSS spreads ports evenly, so it takes about as many
+    attempts as the NIC has channels; after a few times that, keep what we
+    have. */
     Task<void> connect_async() {
         co_await m_channel.connect(m_options);
         co_await login();
+        if (!m_options.m_steer_rx || m_channel.fd() < 0) co_return;
+        Runtime* runtime = Runtime::current();
+        if (runtime == nullptr) co_return;
+        const int cpu = runtime->worker_cpu(Runtime::current_worker_id());
+        const std::uint32_t target = nic::napi_for_cpu(m_channel.fd(), cpu);
+        if (target == 0) co_return;
+        const std::uint32_t attempts = 8 * std::max<std::uint32_t>(1, nic::channel_count(m_channel.fd()));
+        for (std::uint32_t attempt = 0; attempt < attempts; ++attempt) {
+            if (nic::incoming_napi(m_channel.fd()) == target) co_return;
+            co_await m_channel.write_command(0x01, std::span<const std::byte>());  // COM_QUIT
+            co_await m_channel.flush_sends();
+            m_channel.close();
+            m_connected = false;
+            co_await m_channel.connect(m_options);
+            co_await login();
+        }
     }
 
     Task<db::QueryResult> query(std::string_view sql,
@@ -959,7 +1222,7 @@ public:
                 co_await m_channel.write_command(0x03, body);
             }
             std::span<const std::byte> first;
-            SB_NEXT_PACKET(m_channel, result_resource, first);
+            SB_NEXT_PACKET_VIEW(m_channel, result_resource, first);
             co_return db::QueryResult::ok(co_await read_result(result_resource, first, false));
         } catch (const db::Error& error) {
             co_return db::QueryResult::err(error);
@@ -976,7 +1239,7 @@ public:
             co_await m_channel.write_command(0x03, std::as_bytes(std::span(sql)));
         }
         std::span<const std::byte> first;
-        SB_NEXT_PACKET(m_channel, result_resource, first);
+        SB_NEXT_PACKET_VIEW(m_channel, result_resource, first);
         db::ResultSet result = co_await read_result(result_resource, first, false);
         co_return result;
     }
@@ -1005,7 +1268,7 @@ public:
                     mem::ScopedAllocator scope(results);
                     m_channel.expect_reply();
                     std::span<const std::byte> first;
-                    SB_NEXT_PACKET(m_channel, scope, first);
+                    SB_NEXT_PACKET_VIEW(m_channel, scope, first);
                     (void)co_await read_result(scope, first, false);
                 }
                 ++received;
@@ -1163,7 +1426,7 @@ public:
         try {
             m_channel.expect_reply();
             std::span<const std::byte> first;
-            SB_NEXT_PACKET(m_channel, scratch, first);
+            SB_NEXT_PACKET_VIEW(m_channel, scratch, first);
             (void)co_await read_result(scratch, first, binary);
             co_return db::Status::ok();
         } catch (const db::Error& error) {
@@ -1178,6 +1441,27 @@ public:
 
     [[nodiscard]] std::uint32_t pending_replies() const noexcept override {
         return m_pending_count;
+    }
+    [[nodiscard]] int native_socket() const noexcept override { return m_channel.fd(); }
+
+    [[nodiscard]] bool supports_sync() const noexcept override {
+        return m_connected && m_pending_count == 0 && m_channel.synchronous();
+    }
+
+    bool query_into(std::string_view sql, db::ResultSet& out, mem::MemoryResource& resource,
+                    db::Error& error) override {
+        try {
+            m_channel.send_command_sync(0x03, std::as_bytes(std::span(sql)));
+            read_result_sync(out, resource, m_channel.next_packet_sync(resource), false);
+            return true;
+        } catch (const db::Error& failure) {
+            error = failure;
+        } catch (const std::bad_alloc&) {
+            error = db::Error("MySQL client out of memory (heap exhausted)", 2008);
+        } catch (...) {
+            error = db::Error("unexpected MySQL query error");
+        }
+        return false;
     }
 
     static constexpr std::uint32_t kMaxPipeline = 256;
@@ -1200,106 +1484,165 @@ public:
         resource.deallocate(this, sizeof(*this), alignof(MysqlConnection));
     }
 
-    Task<db::ResultSet> read_result(mem::MemoryResource& resource,
-                                    std::span<const std::byte> first, bool binary) {
-        db::ResultSet result(resource);
-        if (first.empty()) throw db::Error("empty MySQL response", 2027);
-        const auto header = std::to_integer<std::uint8_t>(first[0]);
-        if (header == 0xff) throw_server_error(first);
-        if (header == 0x00) {
-            OkPacket ok;
-            if (!parse_ok(first, ok)) throw db::Error("malformed OK packet", 2027);
-            result.m_has_rows = false;
-            result.m_affected_rows = ok.m_affected_rows;
-            result.m_last_insert_id = ok.m_last_insert_id;
-            result.m_status = ok.m_status;
-            result.m_warnings = ok.m_warnings;
-            while ((result.m_status & SERVER_MORE_RESULTS_EXISTS) != 0) {
-                std::span<const std::byte> next;
-                SB_NEXT_PACKET(m_channel, resource, next);
-                auto extra = co_await read_result(resource, next, binary);
-                result.m_warnings += extra.m_warnings;
-                result.m_status = extra.m_status;
-            }
-            co_return result;
-        }
+    /* A reply's packets, parsed one at a time into a ResultSet.  The parser
+    only consumes packets; the reader (awaiting or blocking) fetches them.
+    Packets may be views into the read buffer: only row packets are kept
+    (copied), and column definitions keep just their names.  Further result
+    sets (SERVER_MORE_RESULTS_EXISTS) are parsed and dropped, adding their
+    warnings and taking their status, as before. */
+    class ResultParser {
+    public:
+        // Fills `out`, which the caller has reset.
+        ResultParser(db::ResultSet& out, mem::MemoryResource& resource, bool binary)
+            : m_result(out), m_resource(&resource), m_binary(binary) {}
 
-        Reader count_reader(first);
-        std::uint64_t column_count = 0;
-        if (!count_reader.lenenc(column_count) || column_count > kMaxColumns) {
-            throw db::Error("invalid MySQL column count", 2027);
-        }
-        result.m_columns.reserve(static_cast<std::size_t>(column_count));
-        for (std::uint64_t i = 0; i < column_count; ++i) {
-            std::span<const std::byte> packet;
-            SB_NEXT_PACKET(m_channel, resource, packet);
-            {
-                SB_LAYER(Protocol);
-                db::Column column;
-                if (!parse_column(packet, column)) {
-                    throw db::Error("malformed MySQL column definition", 2027);
-                }
-                result.m_columns.push_back(column);
-            }
-        }
-
-        std::span<const std::byte> terminator;
-        SB_NEXT_PACKET(m_channel, resource, terminator);
-        {
+        // True when the reply is complete.
+        bool feed(std::span<const std::byte> packet) {
             SB_LAYER(Protocol);
+            switch (m_state) {
+                case State::First: return first(packet);
+                case State::Columns: return column(packet);
+                case State::Terminator: return terminator(packet);
+                case State::Rows: return row(packet);
+            }
+            return true;
+        }
+    private:
+        enum class State : std::uint8_t { First, Columns, Terminator, Rows };
+
+        bool first(std::span<const std::byte> packet) {
+            if (packet.empty()) throw db::Error("empty MySQL response", 2027);
+            const auto header = std::to_integer<std::uint8_t>(packet[0]);
+            if (header == 0xff) throw_server_error(packet);
+            if (header == 0x00) {
+                OkPacket ok;
+                if (!parse_ok(packet, ok)) throw db::Error("malformed OK packet", 2027);
+                if (m_extra) return finish_extra(ok.m_status, ok.m_warnings);
+                m_result.m_has_rows = false;
+                m_result.m_affected_rows = ok.m_affected_rows;
+                m_result.m_last_insert_id = ok.m_last_insert_id;
+                m_result.m_status = ok.m_status;
+                m_result.m_warnings = ok.m_warnings;
+                return next_result(ok.m_status);
+            }
+            Reader count_reader(packet);
+            if (!count_reader.lenenc(m_column_count) || m_column_count > kMaxColumns) {
+                throw db::Error("invalid MySQL column count", 2027);
+            }
+            m_columns_seen = 0;
+            if (!m_extra) m_result.m_columns.reserve(static_cast<std::size_t>(m_column_count));
+            m_state = m_column_count == 0 ? State::Terminator : State::Columns;
+            return false;
+        }
+
+        bool column(std::span<const std::byte> packet) {
+            db::Column column;
+            if (!parse_column(packet, column)) {
+                throw db::Error("malformed MySQL column definition", 2027);
+            }
+            if (!m_extra) {
+                if (!column.m_name.empty()) {
+                    auto* name = static_cast<char*>(m_resource->allocate(column.m_name.size(), 1));
+                    std::memcpy(name, column.m_name.data(), column.m_name.size());
+                    column.m_name = std::string_view(name, column.m_name.size());
+                }
+                m_result.m_columns.push_back(column);
+            }
+            if (++m_columns_seen == m_column_count) m_state = State::Terminator;
+            return false;
+        }
+
+        bool terminator(std::span<const std::byte> packet) {
             EofPacket eof{};
-            if (!parse_eof(terminator, eof)) {
+            if (!parse_eof(packet, eof)) {
                 // Tolerate servers that answer with OK despite no DEPRECATE_EOF.
                 OkPacket ok{};
-                if (!parse_ok(terminator, ok)) {
-                    throw db::Error("missing metadata terminator", 2027);
-                }
+                if (!parse_ok(packet, ok)) throw db::Error("missing metadata terminator", 2027);
                 eof.m_status = ok.m_status;
                 eof.m_warnings = ok.m_warnings;
             }
-            result.m_status = eof.m_status;
-            result.m_warnings = eof.m_warnings;
-            result.m_has_rows = true;
+            if (!m_extra) {
+                m_result.m_status = eof.m_status;
+                m_result.m_warnings = eof.m_warnings;
+                m_result.m_has_rows = true;
+            }
+            m_state = State::Rows;
+            return false;
         }
 
-        for (;;) {
-            std::span<const std::byte> packet;
-            SB_NEXT_PACKET(m_channel, resource, packet);
+        bool row(std::span<const std::byte> packet) {
             if (!packet.empty() && std::to_integer<std::uint8_t>(packet[0]) == 0xff) {
                 throw_server_error(packet);
             }
             if (!packet.empty() && std::to_integer<std::uint8_t>(packet[0]) == 0xfe &&
                 packet.size() < 9) {
                 EofPacket row_eof{};
-                if (!parse_eof(packet, row_eof)) {
-                    throw db::Error("malformed EOF packet", 2027);
-                }
-                result.m_status = row_eof.m_status;
-                result.m_warnings = row_eof.m_warnings;
-                break;
+                if (!parse_eof(packet, row_eof)) throw db::Error("malformed EOF packet", 2027);
+                if (m_extra) return finish_extra(row_eof.m_status, row_eof.m_warnings);
+                m_result.m_status = row_eof.m_status;
+                m_result.m_warnings = row_eof.m_warnings;
+                return next_result(row_eof.m_status);
             }
-            SB_LAYER(Protocol);
-            db::Row row(resource);
-            const bool parsed = binary
-                                    ? parse_binary_row(packet, result.m_columns, resource, row)
-                                    : parse_text_row(packet,
-                                                     static_cast<std::size_t>(column_count),
-                                                     resource, row);
+            if (m_extra) return false;
+            /* A row's fields point into its packet, which outlives this read:
+            copy the packet (only rows are kept; terminators are not). */
+            if (!packet.empty()) {
+                auto* kept = static_cast<std::byte*>(m_resource->allocate(packet.size(), 1));
+                std::memcpy(kept, packet.data(), packet.size());
+                packet = std::span<const std::byte>(kept, packet.size());
+            }
+            const bool parsed =
+                m_binary ? parse_binary_row(packet, m_result.m_columns, *m_resource,
+                                            m_result.m_fields)
+                         : parse_text_row(packet, static_cast<std::size_t>(m_column_count),
+                                          *m_resource, m_result.m_fields);
             if (!parsed) throw db::Error("malformed MySQL row", 2027);
-            result.m_rows.push_back(std::move(row));
+            ++m_result.m_row_count;
+            return false;
         }
 
-        if ((result.m_status & SERVER_MORE_RESULTS_EXISTS) != 0) {
-            for (;;) {
-                std::span<const std::byte> next;
-                SB_NEXT_PACKET(m_channel, resource, next);
-                auto extra = co_await read_result(resource, next, binary);
-                result.m_warnings += extra.m_warnings;
-                result.m_status = extra.m_status;
-                if ((extra.m_status & SERVER_MORE_RESULTS_EXISTS) == 0) break;
-            }
+        // The current result set ended with `status`: another follows?
+        bool next_result(std::uint16_t status) {
+            if ((status & SERVER_MORE_RESULTS_EXISTS) == 0) return true;
+            m_extra = true;
+            m_state = State::First;
+            return false;
+        }
+        bool finish_extra(std::uint16_t status, std::uint16_t warnings) {
+            m_result.m_warnings += warnings;
+            m_result.m_status = status;
+            return next_result(status);
+        }
+
+        db::ResultSet& m_result;
+        mem::MemoryResource* m_resource;
+        bool m_binary;
+        bool m_extra = false;
+        State m_state = State::First;
+        std::uint64_t m_column_count = 0;
+        std::uint64_t m_columns_seen = 0;
+    };
+
+    Task<db::ResultSet> read_result(mem::MemoryResource& resource,
+                                    std::span<const std::byte> first, bool binary) {
+        db::ResultSet result(resource);
+        ResultParser parser(result, resource, binary);
+        bool done = parser.feed(first);
+        while (!done) {
+            std::span<const std::byte> packet;
+            SB_NEXT_PACKET_VIEW(m_channel, resource, packet);
+            done = parser.feed(packet);
         }
         co_return result;
+    }
+
+    // The same, reading with blocking calls: a plain function, no frame.
+    void read_result_sync(db::ResultSet& out, mem::MemoryResource& resource,
+                          std::span<const std::byte> first, bool binary) {
+        out.reset(resource);
+        ResultParser parser(out, resource, binary);
+        bool done = parser.feed(first);
+        while (!done) done = parser.feed(m_channel.next_packet_sync(resource));
     }
 
     void mark_disconnected() noexcept { m_connected = false; }
@@ -1311,7 +1654,7 @@ private:
     std::array<bool, kMaxPipeline> m_pending_binary{};
     std::uint32_t m_pending_first = 0;
     std::uint32_t m_pending_count = 0;
-    void throw_server_error(std::span<const std::byte> packet) {
+    [[noreturn]] static void throw_server_error(std::span<const std::byte> packet) {
         ErrorPacket error;
         if (!parse_error(packet, error)) {
             throw db::Error("malformed MySQL error packet", 2027);
@@ -1326,8 +1669,12 @@ private:
         throw db::Error(message, code);
     }
 
+    /* Handshake and authentication packets are scratch: they live in an arena
+    carved from the request heap and released when the login ends, so logging
+    in again (reconnect, NIC steering) costs the connection heap nothing. */
     Task<void> login() {
-        const auto handshake_packet = co_await m_channel.read_packet(*m_persistent);
+        mem::BumpArena login_scratch(m_request_heap, 8 * 1024, "login");
+        const auto handshake_packet = co_await m_channel.read_packet(login_scratch);
         if (handshake_packet.empty()) {
             throw db::Error("empty MySQL handshake", 2027);
         }
@@ -1355,7 +1702,7 @@ private:
                 }
             } else {
                 Bytes ssl_request =
-                    build_ssl_request(handshake, m_options, *m_persistent);
+                    build_ssl_request(handshake, m_options, login_scratch);
                 co_await m_channel.write_packet(ssl_request);
                 co_await m_channel.start_tls(m_options);
                 tls = true;
@@ -1365,16 +1712,16 @@ private:
             Bytes auth = auth_response_for(
                 plugin, m_options.m_password,
                 std::span<const std::uint8_t>(scramble.data(), scramble_length),
-                *m_persistent);
+                login_scratch);
             return build_handshake_response(handshake, m_options, auth, plugin,
-                                            *m_persistent, use_tls);
+                                            login_scratch, use_tls);
         };
 
         Bytes response = build_response(tls);
         co_await m_channel.write_packet(response);
 
         for (;;) {
-            const auto packet = co_await m_channel.read_packet(*m_persistent);
+            const auto packet = co_await m_channel.read_packet(login_scratch);
             if (packet.empty()) throw db::Error("empty auth response", 2027);
             const auto header = std::to_integer<std::uint8_t>(packet[0]);
             if (header == 0x00) {
@@ -1405,7 +1752,7 @@ private:
                     if (!m_channel.tls_active()) {
                         throw db::Error("mysql_clear_password requires TLS", 2026);
                     }
-                    Bytes clear = make_bytes(*m_persistent);
+                    Bytes clear = make_bytes(login_scratch);
                     clear.resize(m_options.m_password.size() + 1);
                     std::memcpy(clear.data(), m_options.m_password.data(),
                                 m_options.m_password.size());
@@ -1430,7 +1777,7 @@ private:
                      std::to_integer<std::uint8_t>(data[0]) == 0x04) ||
                     sha256) {
                     if (m_channel.tls_active()) {
-                        Bytes clear = make_bytes(*m_persistent);
+                        Bytes clear = make_bytes(login_scratch);
                         clear.resize(m_options.m_password.size() + 1);
                         std::memcpy(clear.data(), m_options.m_password.data(),
                                     m_options.m_password.size());
@@ -1441,7 +1788,7 @@ private:
                     // Request the server's RSA public key.
                     const std::array<std::byte, 1> request{std::byte{0x02}};
                     co_await m_channel.write_packet(request);
-                    const auto key_packet = co_await m_channel.read_packet(*m_persistent);
+                    const auto key_packet = co_await m_channel.read_packet(login_scratch);
                     if (key_packet.empty()) {
                         throw db::Error("empty RSA key packet", 2027);
                     }
@@ -1456,7 +1803,7 @@ private:
                         m_options.m_password,
                         std::span<const std::uint8_t>(scramble.data(), scramble_length),
                         {reinterpret_cast<const char*>(pem.data()), pem.size()},
-                        *m_persistent);
+                        login_scratch);
                     co_await m_channel.write_packet(encrypted);
                     continue;
                 }
@@ -1466,7 +1813,7 @@ private:
                         m_options.m_password,
                         std::span<const std::uint8_t>(scramble.data(), scramble_length),
                         {reinterpret_cast<const char*>(data.data()), data.size()},
-                        *m_persistent);
+                        login_scratch);
                     co_await m_channel.write_packet(encrypted);
                     continue;
                 }
@@ -1511,13 +1858,13 @@ Task<db::QueryResult> MysqlStatement::execute(
         }
         Bytes& request = m_connection->request_buffer();
         request.clear();
-        build_stmt_execute_payload(request, m_id, parameters);
+        build_stmt_execute_payload(request, m_id, parameters, types_changed(parameters));
         PacketChannel& channel = m_connection->channel();
         if (!channel.try_send_command(std::span<const std::byte>(request))) {
             co_await channel.write_command(request);
         }
         std::span<const std::byte> first;
-        SB_NEXT_PACKET(channel, result_resource, first);
+        SB_NEXT_PACKET_VIEW(channel, result_resource, first);
         if (!first.empty() && std::to_integer<std::uint8_t>(first[0]) == 0xff) {
             ErrorPacket error;
             if (!parse_error(first, error)) {
@@ -1535,6 +1882,37 @@ Task<db::QueryResult> MysqlStatement::execute(
         co_return db::QueryResult::err(
             db::Error("unexpected MySQL statement error"));
     }
+}
+
+/* Synchronous execute: COM_STMT_EXECUTE and its reply in this call. */
+bool MysqlStatement::execute_into(std::span<const db::BindValue> parameters,
+                                  db::ResultSet& out, mem::MemoryResource& resource,
+                                  db::Error& error) {
+    try {
+        if (m_closed) throw db::Error("prepared statement is closed", 1243);
+        if (m_text_mode) {
+            if (!parameters.empty()) {
+                throw db::Error("text-fallback statement cannot bind parameters", 1295);
+            }
+            return m_connection->query_into(std::string_view(m_sql.data(), m_sql.size()), out,
+                                            resource, error);
+        }
+        Bytes& request = m_connection->request_buffer();
+        request.clear();
+        build_stmt_execute_payload(request, m_id, parameters, types_changed(parameters));
+        PacketChannel& channel = m_connection->channel();
+        const auto payload = std::span<const std::byte>(request);
+        channel.send_command_sync(std::to_integer<std::uint8_t>(payload[0]), payload.subspan(1));
+        m_connection->read_result_sync(out, resource, channel.next_packet_sync(resource), true);
+        return true;
+    } catch (const db::Error& failure) {
+        error = failure;
+    } catch (const std::bad_alloc&) {
+        error = db::Error("MySQL client out of memory (heap exhausted)", 2008);
+    } catch (...) {
+        error = db::Error("unexpected MySQL statement error");
+    }
+    return false;
 }
 
 /* Pipelined execute: write COM_STMT_EXECUTE, leave the reply to
@@ -1556,7 +1934,7 @@ Task<db::Status> MysqlStatement::send_execute(std::span<const db::BindValue> par
         }
         Bytes& request = m_connection->request_buffer();
         request.clear();
-        build_stmt_execute_payload(request, m_id, parameters);
+        build_stmt_execute_payload(request, m_id, parameters, types_changed(parameters));
         PacketChannel& channel = m_connection->channel();
         if (!channel.try_send_command(std::span<const std::byte>(request))) {
             co_await channel.write_command(request);
@@ -1585,12 +1963,12 @@ Task<db::ResultSet> MysqlStatement::execute_impl(
     }
     Bytes& request = m_connection->request_buffer();
     request.clear();
-    build_stmt_execute_payload(request, m_id, parameters);
+    build_stmt_execute_payload(request, m_id, parameters, types_changed(parameters));
     if (!m_connection->channel().try_send_command(std::span<const std::byte>(request))) {
         co_await m_connection->channel().write_command(request);
     }
     std::span<const std::byte> first;
-    SB_NEXT_PACKET(m_connection->channel(), result_resource, first);
+    SB_NEXT_PACKET_VIEW(m_connection->channel(), result_resource, first);
     if (!first.empty() && std::to_integer<std::uint8_t>(first[0]) == 0xff) {
         ErrorPacket error;
         if (!parse_error(first, error)) {
@@ -1656,6 +2034,12 @@ public:
             connection->close();
             connection->destroy(persistent);
             co_return db::ConnectResult::err(error);
+        } catch (const std::exception& failure) {
+            connection->close();
+            connection->destroy(persistent);
+            char message[256];
+            std::snprintf(message, sizeof(message), "MySQL connect failed: %s", failure.what());
+            co_return db::ConnectResult::err(db::Error(message, 2013));
         } catch (...) {
             connection->close();
             connection->destroy(persistent);
