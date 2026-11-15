@@ -8,6 +8,11 @@ project(sysbench_cpp
 option(SYSBENCH_NATIVE "Build with -march=native" OFF)
 option(SYSBENCH_WERROR "Treat compiler warnings as errors" OFF)
 option(SYSBENCH_BUILD_TESTS "Build unit and performance tests" ON)
+option(SYSBENCH_LAYER_STATS "Account TSC cycles per layer and print a per-query breakdown" OFF)
+set(SYSBENCH_MYSQL_CLIENT_LIB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../mysql-client-lib"
+    CACHE PATH "Path to the Rust mysql-client-lib source tree")
+# The Rust client is opt-in: benchmarks use the C++ client (protocol 1).
+option(SYSBENCH_MYSQL_V2 "Build sql-rust protocol revision 2 using the Rust client" OFF)
 
 set(CMAKE_CXX_STANDARD 26)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -17,9 +22,9 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 find_package(Threads REQUIRED)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(LIBURING REQUIRED IMPORTED_TARGET liburing)
-pkg_check_modules(LUA REQUIRED IMPORTED_TARGET lua5.4)
 find_package(OpenSSL REQUIRED)
 find_library(NUMA_LIBRARY numa REQUIRED)
+include(cmake/LuaJIT.cmake)
 
 include(GNUInstallDirs)
 set(CMAKE_INSTALL_DOCDIR "${CMAKE_INSTALL_DATAROOTDIR}/doc/sysbench-cpp")
@@ -33,6 +38,8 @@ add_library(sysbench_core STATIC
     src/socket_io.cpp
     src/db.cpp
     src/stats.cpp
+    src/layer_stats.cpp
+    src/nic_queues.cpp
     src/options.cpp
     src/mysql_wire.cpp
     src/mysql_connection.cpp
@@ -48,7 +55,7 @@ target_link_libraries(sysbench_core
     PUBLIC
         Threads::Threads
         PkgConfig::LIBURING
-        PkgConfig::LUA
+        luajit
         ${NUMA_LIBRARY}
     PRIVATE
         OpenSSL::Crypto
@@ -70,8 +77,21 @@ target_compile_definitions(sysbench_core PUBLIC
     SYSBENCH_VERSION="${PROJECT_VERSION}"
     SYSBENCH_LUA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/lua"
     SYSBENCH_INSTALL_LUA_DIR="${SYSBENCH_INSTALL_LUA_DIR}")
+if(SYSBENCH_LAYER_STATS)
+    target_compile_definitions(sysbench_core PUBLIC SYSBENCH_LAYER_STATS=1)
+endif()
+option(SYSBENCH_TURNAROUND "Report the client turnaround (reply reaped to next submit) per worker" OFF)
+if(SYSBENCH_TURNAROUND)
+    target_compile_definitions(sysbench_core PUBLIC SYSBENCH_TURNAROUND=1)
+endif()
 
 add_executable(sysbench26 src/main.cpp)
+# One-connection prepared SELECT 1, one layer at a time (diagnostics).
+add_executable(sb_netbench tools/netbench.cpp)
+target_link_libraries(sb_netbench PRIVATE sysbench_core)
+if(SYSBENCH_MYSQL_V2)
+    include(cmake/MySQLV2.cmake)
+endif()
 target_link_libraries(sysbench26 PRIVATE sysbench_core)
 target_compile_options(sysbench26 PRIVATE -Wall -Wextra -Wpedantic -Wshadow)
 

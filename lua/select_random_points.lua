@@ -51,9 +51,12 @@ function thread_init()
    rlen = sysbench.opt.table_size / sysbench.opt.threads
 
    thread_id = sysbench.tid % sysbench.opt.threads
+
+   enable_streaming(con)
 end
 
 function thread_done()
+   con:flush()
    stmt:close()
    con:disconnect()
 end

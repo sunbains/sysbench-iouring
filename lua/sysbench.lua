@@ -2,15 +2,27 @@
 unpack = unpack or table.unpack
 getn = getn or table.getn
 
--- sysbench-compatible Lua runtime (PUC Lua 5.4, no FFI required).
+-- sysbench-compatible Lua runtime (LuaJIT; the hot path calls C++ through the FFI).
 -- Copyright (C) 2026 sysbench-cpp contributors.
 -- Derived from sysbench's GPLv2 Lua interface.
 
 sysbench.hooks = sysbench.hooks or {}
 
+local more_events = sysbench.ffi.more_events
+local event_start = sysbench.ffi.event_start
+local event_stop = sysbench.ffi.event_stop
+local YIELD = sysbench.ffi.YIELD
+local yield = coroutine.yield
+
 function thread_run(thread_id)
-   while sb_more_events() do
-      sb_event_start()
+   while true do
+      local more = more_events()
+      if more == 0 then break end
+      -- Fair yield: give the worker's other connections a turn (on the runtime).
+      if more == YIELD then yield() end
+      if event_start() ~= 0 then
+         error("event_start without a benchmark runtime")
+      end
 
       local success, ret
       repeat
@@ -33,7 +45,8 @@ function thread_run(thread_id)
          break
       end
 
-      sb_event_stop()
+      -- --rate: wait (on the runtime) for the next event's slot.
+      if event_stop() == YIELD then yield() end
    end
 end
 

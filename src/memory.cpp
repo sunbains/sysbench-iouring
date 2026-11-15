@@ -15,6 +15,7 @@
 // Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
 #include <print>
+#include "sysbench/layer_stats.hpp"
 #include "sysbench/memory.hpp"
 #include "sysbench/numa.hpp"
 
@@ -174,15 +175,23 @@ HeapArena::~HeapArena() {
     }
 }
 
+// Block sizes are multiples of 16 below 4 GiB.
 std::uint32_t HeapArena::bin_for(std::size_t bytes) noexcept {
-    if (bytes <= kMinBlock) return 0;
-    unsigned int log = 0;
-    std::size_t value = bytes - 1;
-    while (value != 0) {
-        value >>= 1;
-        ++log;
-    }
-    return std::min<std::uint32_t>(log - 5, kBinCount - 1);
+    if (bytes < kSmallLimit) return static_cast<std::uint32_t>(bytes >> 4);
+    const unsigned level = 63u - static_cast<unsigned>(__builtin_clzll(bytes));
+    const auto sub = static_cast<std::uint32_t>((bytes >> (level - kSubBinBits)) &
+                                                ((1u << kSubBinBits) - 1));
+    const std::uint32_t bin =
+        static_cast<std::uint32_t>(kSmallBins) + ((level - 10) << kSubBinBits) + sub;
+    return std::min<std::uint32_t>(bin, kBinCount - 1);
+}
+
+std::uint32_t HeapArena::search_bin(std::size_t bytes) noexcept {
+    if (bytes < kSmallLimit) return static_cast<std::uint32_t>(bytes >> 4);
+    const unsigned level = 63u - static_cast<unsigned>(__builtin_clzll(bytes));
+    const std::size_t rounded = bytes + (std::size_t{1} << (level - kSubBinBits)) - 1;
+    if (rounded >> 32 != 0) return static_cast<std::uint32_t>(kBinCount);
+    return bin_for(rounded);
 }
 
 HeapArena::Block* HeapArena::block_of(void* ptr) const noexcept {
@@ -198,16 +207,21 @@ void HeapArena::insert_free(Block* block) noexcept {
     block->m_bin = bin;
     block->m_is_free = 1;
     block->m_prev_free = nullptr;
-    block->m_next_free = m_bins[bin];
-    if (m_bins[bin] != nullptr) m_bins[bin]->m_prev_free = block;
-    m_bins[bin] = block;
+    Block* first = head(bin);
+    block->m_next_free = first;
+    if (first != nullptr) first->m_prev_free = block;
+    set_head(bin, block);
+    m_bin_map[bin / 64] |= std::uint64_t{1} << (bin % 64);
 }
 
 void HeapArena::remove_free(Block* block) noexcept {
     if (block->m_prev_free != nullptr) {
         block->m_prev_free->m_next_free = block->m_next_free;
     } else {
-        m_bins[block->m_bin] = block->m_next_free;
+        set_head(block->m_bin, block->m_next_free);
+        if (block->m_next_free == nullptr) {
+            m_bin_map[block->m_bin / 64] &= ~(std::uint64_t{1} << (block->m_bin % 64));
+        }
     }
     if (block->m_next_free != nullptr) block->m_next_free->m_prev_free = block->m_prev_free;
     block->m_next_free = nullptr;
@@ -215,14 +229,21 @@ void HeapArena::remove_free(Block* block) noexcept {
     block->m_is_free = 0;
 }
 
+/* First the bins whose every block fits (a bitmap search, O(1)).  Only when
+they are all empty, the request's own bin, whose blocks may or may not fit:
+a nearly full heap then still finds the block a size-ordered search would. */
 HeapArena::Block* HeapArena::find_fit(std::size_t wanted) noexcept {
-    const std::uint32_t first = bin_for(wanted);
-    for (std::uint32_t bin = first; bin < kBinCount; ++bin) {
-        Block* block = m_bins[bin];
-        while (block != nullptr) {
-            if (block->m_size >= wanted) return block;
-            block = block->m_next_free;
+    const std::uint32_t first = search_bin(wanted);
+    if (first < kBinCount) {
+        std::size_t word = first / 64;
+        std::uint64_t bits = m_bin_map[word] & (~std::uint64_t{0} << (first % 64));
+        while (bits == 0 && ++word < std::size(m_bin_map)) bits = m_bin_map[word];
+        if (bits != 0) {
+            return head(word * 64 + static_cast<std::size_t>(__builtin_ctzll(bits)));
         }
+    }
+    for (Block* block = head(bin_for(wanted)); block != nullptr; block = block->m_next_free) {
+        if (block->m_size >= wanted) return block;
     }
     return nullptr;
 }
@@ -368,6 +389,7 @@ ResourceStats HeapArena::stats() const noexcept {
 
 void HeapArena::reset() noexcept {
     std::memset(m_bins, 0, sizeof(m_bins));
+    std::memset(m_bin_map, 0, sizeof(m_bin_map));
     auto* initial = reinterpret_cast<Block*>(m_base);
     initial->m_size = saturating_u32(m_capacity);
     initial->m_prev_size = 0;
@@ -596,7 +618,27 @@ struct FrameSlab {
 };
 
 thread_local int tls_frame_node = 0;
-constexpr std::size_t kFrameCachePerClass = 8;
+
+// The coroutine frame allocator.  Coroutines are pinned to the worker that
+// created them, so a frame is almost always freed on the thread that allocated
+// it.  Each thread keeps its own per-class free lists: allocation and free are
+// a pointer pop and push with no atomics and no shared cache line.  A frame
+// carries its owner's token; one freed on another thread (rare) goes to the
+// per-node shared stack, from which an owner refills only when its own list
+// and slab are both exhausted.
+std::atomic<std::uint32_t> g_next_frame_owner{1};
+thread_local std::uint32_t tls_frame_owner = 0;
+
+std::uint32_t frame_owner() noexcept {
+    if (tls_frame_owner == 0)
+        tls_frame_owner = g_next_frame_owner.fetch_add(1, std::memory_order_relaxed);
+    return tls_frame_owner;
+}
+// Frames are recycled on the thread that frees them.  A query creates and
+// destroys several frames of one class per resume (destruction is deferred until
+// the resume unwinds), so a small cache overflowed into the per-node shared
+// stack on every query and every worker of the node fought over its head.
+constexpr std::size_t kFrameCachePerClass = 1024;
 thread_local FrameHeader* tls_frame_cache[kFrameClasses]{};
 thread_local std::uint16_t tls_frame_cache_count[kFrameClasses]{};
 thread_local std::array<FrameSlab, numa::kMaxNodes> tls_frame_slabs{};
@@ -687,41 +729,35 @@ void set_thread_frame_node(int node) noexcept {
 }
 
 void* allocate_task_frame(std::size_t size) {
+    SB_LAYER(Memory);
     const int node = tls_frame_node;
     const std::size_t index = frame_class(size);
+    const std::uint32_t owner = frame_owner();
+
+    if (FrameHeader* header = tls_frame_cache[index]; header != nullptr) [[likely]] {
+        tls_frame_cache[index] = header->m_next;
+        header->m_next = nullptr;
+        header->m_magic = kFrameAlive;
+        header->m_reserved = owner;
+        return reinterpret_cast<std::byte*>(header) + kFrameReserve;
+    }
+
     const std::size_t capacity = frame_capacity(index);
     const std::size_t need = (capacity + kFrameReserve + 63) & ~std::size_t(63);
-
-    if (tls_frame_cache[index] != nullptr) {
-        FrameHeader* header = tls_frame_cache[index];
-        tls_frame_cache[index] = header->m_next;
-        --tls_frame_cache_count[index];
-        header->m_next = nullptr;
-        header->m_magic = kFrameAlive;
-        return reinterpret_cast<std::byte*>(header) + kFrameReserve;
-    }
-
-    FrameStack& stack = frame_stack_for(node, index);
-    for (std::size_t i = 0; i < kFrameCachePerClass; ++i) {
-        FrameHeader* header = pop_frame(stack);
-        if (header == nullptr) break;
-        header->m_next = tls_frame_cache[index];
-        tls_frame_cache[index] = header;
-        ++tls_frame_cache_count[index];
-    }
-    if (tls_frame_cache[index] != nullptr) {
-        FrameHeader* header = tls_frame_cache[index];
-        tls_frame_cache[index] = header->m_next;
-        --tls_frame_cache_count[index];
-        header->m_next = nullptr;
-        header->m_magic = kFrameAlive;
-        return reinterpret_cast<std::byte*>(header) + kFrameReserve;
-    }
-
     const std::size_t safe_node =
         node >= 0 && static_cast<std::uint32_t>(node) < numa::kMaxNodes
             ? static_cast<std::size_t>(node)
             : 0;
+
+    /* Frames another thread gave back for this node and class. */
+    if (FrameHeader* header = pop_frame(frame_stack_for(node, index));
+        header != nullptr) {
+        header->m_next = nullptr;
+        header->m_magic = kFrameAlive;
+        header->m_reserved = owner;
+        return reinterpret_cast<std::byte*>(header) + kFrameReserve;
+    }
+
     FrameSlab& slab = tls_frame_slabs[safe_node];
     if (slab.m_base == nullptr || slab.m_used + need > slab.m_capacity) {
         const std::size_t slab_size = align_up(std::max(kFrameSlabSize, need), 4096);
@@ -739,12 +775,13 @@ void* allocate_task_frame(std::size_t size) {
     header->m_class_index = static_cast<std::uint32_t>(index);
     header->m_node = static_cast<std::uint32_t>(safe_node);
     header->m_magic = kFrameAlive;
-    header->m_reserved = 0;
+    header->m_reserved = owner;
     header->m_next = nullptr;
     return reinterpret_cast<std::byte*>(header) + kFrameReserve;
 }
 
 void deallocate_task_frame(void* pointer, std::size_t) noexcept {
+    SB_LAYER(Memory);
     if (pointer == nullptr) return;
     auto* header = reinterpret_cast<FrameHeader*>(
         static_cast<std::byte*>(pointer) - kFrameReserve);
@@ -756,11 +793,10 @@ void deallocate_task_frame(void* pointer, std::size_t) noexcept {
     header->m_magic = kFrameFree;
     const std::size_t index = header->m_class_index;
     if (index >= kFrameClasses) return;
-    if (static_cast<int>(header->m_node) == tls_frame_node &&
-        tls_frame_cache_count[index] < kFrameCachePerClass) {
+    if (header->m_reserved == tls_frame_owner &&
+        static_cast<int>(header->m_node) == tls_frame_node) [[likely]] {
         header->m_next = tls_frame_cache[index];
         tls_frame_cache[index] = header;
-        ++tls_frame_cache_count[index];
         return;
     }
     FrameStack& stack = frame_stack_for(static_cast<int>(header->m_node), index);

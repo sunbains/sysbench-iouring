@@ -227,15 +227,35 @@ void append_packet(Bytes& out, std::uint8_t sequence,
                                              mem::MemoryResource& resource,
                                              bool ssl = false);
 
+// Append one row's fields to `fields`.
 [[nodiscard]] bool parse_text_row(std::span<const std::byte> payload,
                                   std::size_t column_count,
-                                  mem::MemoryResource& resource, db::Row& row);
+                                  mem::MemoryResource& resource,
+                                  mem::Vector<db::Field>& fields);
 [[nodiscard]] bool parse_binary_row(std::span<const std::byte> payload,
                                     std::span<const db::Column> columns,
-                                    mem::MemoryResource& resource, db::Row& row);
+                                    mem::MemoryResource& resource,
+                                    mem::Vector<db::Field>& fields);
+// One row on its own (tests, tools).
+[[nodiscard]] inline bool parse_text_row(std::span<const std::byte> payload,
+                                         std::size_t column_count,
+                                         mem::MemoryResource& resource, db::Row& row) {
+    row.m_fields.clear();
+    return parse_text_row(payload, column_count, resource, row.m_fields);
+}
+[[nodiscard]] inline bool parse_binary_row(std::span<const std::byte> payload,
+                                           std::span<const db::Column> columns,
+                                           mem::MemoryResource& resource, db::Row& row) {
+    row.m_fields.clear();
+    return parse_binary_row(payload, columns, resource, row.m_fields);
+}
 
+// `send_types`: include the parameter types ("new params bound").  The
+// server keeps a statement's bound types, so they are only needed on the
+// first execute and when a type changes; libmysqlclient sends them once.
 void build_stmt_execute_payload(Bytes& out, std::uint32_t statement_id,
-                                std::span<const db::BindValue> parameters);
+                                std::span<const db::BindValue> parameters,
+                                bool send_types = true);
 
 [[nodiscard]] std::string_view type_name(std::uint8_t type) noexcept;
 

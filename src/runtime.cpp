@@ -16,20 +16,26 @@
 
 #include <print>
 #include "sysbench/runtime.hpp"
+#include "sysbench/layer_stats.hpp"
+#include "sysbench/io_ring.hpp"
 #include "sysbench/lockfree_queue.hpp"
 #include "sysbench/numa.hpp"
 
 #include <poll.h>
 #include <pthread.h>
+#include <ctime>
+#include <sys/syscall.h>
+#include <linux/futex.h>
 #include <sched.h>
-#include <sys/eventfd.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <bit>
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
 #include <chrono>
+#include <optional>
 #include <stdexcept>
 #include <utility>
 
@@ -71,13 +77,35 @@ void set_thread_affinity(std::uint32_t cpu) {
 #endif
 }
 
-inline void cpu_relax() noexcept {
-#if defined(__x86_64__) || defined(__i386__)
-    __builtin_ia32_pause();
-#else
-    std::this_thread::yield();
-#endif
+/* TSC timing for the scheduler's learned waits.  The rate is measured once
+against the steady clock when the runtime starts. */
+[[nodiscard]] inline std::uint64_t tsc_now() noexcept { return __builtin_ia32_rdtsc(); }
+double g_cycles_per_ns = 1.0;
+
+void calibrate_tsc() {
+    const auto clock_start = std::chrono::steady_clock::now();
+    const std::uint64_t tsc_start = tsc_now();
+    while (std::chrono::steady_clock::now() - clock_start < std::chrono::milliseconds(2)) {
+    }
+    const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - clock_start).count();
+    const std::uint64_t cycles = tsc_now() - tsc_start;
+    if (elapsed > 0 && cycles > 0) g_cycles_per_ns = static_cast<double>(cycles) / static_cast<double>(elapsed);
 }
+
+[[nodiscard]] inline std::uint64_t ns_to_cycles(std::uint64_t ns) noexcept {
+    return static_cast<std::uint64_t>(static_cast<double>(ns) * g_cycles_per_ns);
+}
+[[nodiscard]] inline std::uint64_t cycles_to_ns(std::uint64_t cycles) noexcept {
+    return static_cast<std::uint64_t>(static_cast<double>(cycles) / g_cycles_per_ns);
+}
+
+// The scheduler's spin-wait hint (only the scheduler spins).
+inline void spin_pause() noexcept { __builtin_ia32_pause(); }
+
+// Where every learned wait starts before the first sample (as db-runtime's
+// initial read estimate).
+constexpr std::uint64_t kInitialWaitNs = 50'000;
 
 void set_thread_name(const char* name) {
 #if defined(__linux__)
@@ -87,12 +115,6 @@ void set_thread_name(const char* name) {
 #endif
 }
 
-// How long a worker keeps polling its wake sequence after it has submitted I/O
-// before it parks on the eventfd.  A parked worker costs two context switches
-// (and, on an idle core, a C-state exit) per completion, so a bounded spin is
-// cheaper for a busy benchmark; the deadline still lets a slow peer release
-// the CPU.
-constexpr std::chrono::microseconds kIdleSpin{50};
 }  // namespace
 
 struct alignas(4096) Runtime::Worker {
@@ -101,21 +123,22 @@ struct alignas(4096) Runtime::Worker {
     mem::HeapArena m_heap;
     std::thread m_thread;
 
-    // Completion handoff: a multi-producer / single-consumer intrusive stack.
-    // Producers are reapers and the spawning thread; the only popper is this
-    // worker.  ABA cannot occur because only the consumer removes nodes, so a
+    // New tasks: a multi-producer / single-consumer intrusive stack.  The
+    // producer is the spawning thread; the only popper is this worker.  ABA cannot occur because only the consumer removes nodes, so a
     // pushed node can never return to the head behind the consumer's back.
     std::atomic<PromiseBase*> m_injected{nullptr};
     std::atomic<bool> m_waiting{false};
-    int m_wake_fd = -1;
+    // Futex word a sleeping worker waits on; a new task or exit bumps it.
+    std::atomic<std::uint32_t> m_wake_word{0};
     PromiseBase* m_ready_head = nullptr;
     PromiseBase* m_ready_tail = nullptr;
     PromiseBase* m_completed_head = nullptr;
     PromiseBase* m_deferred_head = nullptr;
     PromiseBase* m_timer_head = nullptr;
     std::atomic<bool> m_exiting{false};
-    std::atomic<std::uint32_t> m_pending_io{0};
     int m_numa_node = -1;
+    // The worker's ID among the workers of its NUMA node, given at creation.
+    std::uint32_t m_node_index = 0;
     int m_cpu = -1;
 
     Worker(Runtime* owner, std::uint32_t worker_id, const Config& config,
@@ -125,23 +148,234 @@ struct alignas(4096) Runtime::Worker {
           m_heap(mem::global_root(), config.m_worker_heap_bytes, "worker", node),
           m_numa_node(node),
           m_cpu(pinned_cpu) {
-        m_wake_fd = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-        if (m_wake_fd < 0) throw std::system_error(errno, std::generic_category(),
-                                                 "eventfd");
     }
 
     ~Worker() {
-        if (m_wake_fd >= 0) ::close(m_wake_fd);
     }
 
     Worker(const Worker&) = delete;
     Worker& operator=(const Worker&) = delete;
 
+    // Stall detection, done by the workers themselves: no main thread polls.
+    std::uint64_t m_seen_progress = 0;
+    Clock::time_point m_idle_since{};
+
+    void check_stall() noexcept {
+        if (m_runtime->m_stall_timeout <= std::chrono::milliseconds(0)) return;
+        const auto now = Clock::now();
+        const std::int64_t outstanding = m_runtime->m_outstanding.sum(m_runtime->m_worker_count);
+        const std::uint64_t progress = m_runtime->m_progress.sum(m_runtime->m_worker_count);
+        if (outstanding <= 0 || progress != m_seen_progress ||
+            m_idle_since == Clock::time_point{}) {
+            m_seen_progress = progress;
+            m_idle_since = now;
+            return;
+        }
+        if (now - m_idle_since >= m_runtime->m_stall_timeout)
+            m_runtime->declare_stall(outstanding, now - m_idle_since);
+    }
+
+    // This worker's io_uring, created on its own thread.  Only this worker
+    // submits to it and reaps it.
+    std::optional<IoRing> m_ring;
+    // Busy-poll length currently registered for NAPI (us; 0: NAPI off).
+    std::uint32_t m_napi_us = 0;
+    // Requests issued and not yet reaped.
+    std::uint32_t m_in_flight = 0;
+#if defined(SYSBENCH_TURNAROUND)
+    /* Client turnaround: TSC from reaping an awaited reply to the next
+    submission that carries new requests (our code's share of a round trip). */
+    std::uint64_t m_reply_reaped = 0;
+    std::uint64_t m_turnaround_cycles = 0;
+    std::uint64_t m_turnarounds = 0;
+public:
+    void note_submit() noexcept {
+        if (m_reply_reaped != 0 && m_ring->queued() != 0) {
+            m_turnaround_cycles += tsc_now() - m_reply_reaped;
+            ++m_turnarounds;
+            m_reply_reaped = 0;
+        }
+    }
+#endif
+
+    /* ---- Learned waits ---------------------------------------------------
+    A task that suspends on I/O has declared what it waits for (the awaiter's
+    WaitKind).  The scheduler times every awaited request from issue to
+    completion and keeps, per kind, a decaying maximum of those times (as
+    db-runtime's IoWaitLatency does): a longer sample is taken at once, a
+    shorter one pulls the estimate down by 1/8 of the difference.  Its spins
+    are sized by these estimates, never by a constant. */
+    static constexpr unsigned kKinds = static_cast<unsigned>(WaitKind::Count);
+    std::uint64_t m_wait_cycles[kKinds]{};
+    std::uint32_t m_awaited[kKinds]{};
+
+    void observe_wait(WaitKind kind, std::uint64_t sample) noexcept {
+        std::uint64_t& estimate = m_wait_cycles[static_cast<unsigned>(kind)];
+        if (sample > estimate) {
+            estimate = sample;
+        } else {
+            estimate -= (estimate - sample) >> 3;
+        }
+    }
+
+    // How long the soonest expected completion should take: the largest
+    // estimate among the kinds this worker is waiting on.
+    [[nodiscard]] std::uint64_t expected_wait_cycles() const noexcept {
+        std::uint64_t expected = 0;
+        for (unsigned kind = 0; kind < kKinds; ++kind) {
+            if (m_awaited[kind] != 0) expected = std::max(expected, m_wait_cycles[kind]);
+        }
+        return expected != 0 ? expected
+                             : m_wait_cycles[static_cast<unsigned>(WaitKind::Send)];
+    }
+
+    // Requests in flight that no task awaited when they were issued (posted
+    // sends): their CQEs must not end a wait for an awaited one.
+    std::uint32_t m_unawaited = 0;
+
+    void issued(IoCompletion* completion) noexcept {
+        ++m_in_flight;
+        completion->m_done = false;
+        /* A multishot request is armed once and stays: it is neither an
+        awaited wait to time nor a send whose CQE a wait must look past. */
+        if (completion->m_on_cqe != nullptr) {
+            completion->m_issued = 0;
+            return;
+        }
+        if (completion->m_task != nullptr) {
+            completion->m_issued = tsc_now();
+            ++m_awaited[static_cast<unsigned>(completion->m_kind)];
+        } else {
+            completion->m_issued = 0;
+            ++m_unawaited;
+        }
+    }
+
+    /* Completion records of sends nobody awaits.  The worker owns them, so a
+    connection that goes away with sends in flight orphans its records instead
+    of waiting for them; the reaper takes an orphan back when its CQE comes.
+    Slots are carved from the global root a slab at a time and reused LIFO. */
+    struct SendSlot {
+        IoCompletion m_completion;
+        SendSlot* m_next = nullptr;
+    };
+    static_assert(offsetof(SendSlot, m_completion) == 0);
+    static constexpr std::size_t kSendSlab = 256;
+    SendSlot* m_send_free = nullptr;
+
+    IoCompletion* acquire_send() {
+        if (m_send_free == nullptr) {
+            auto* slab = static_cast<SendSlot*>(mem::global_root().allocate(
+                sizeof(SendSlot) * kSendSlab, alignof(SendSlot)));
+            for (std::size_t i = 0; i < kSendSlab; ++i) {
+                auto* slot = ::new (static_cast<void*>(slab + i)) SendSlot{};
+                slot->m_next = m_send_free;
+                m_send_free = slot;
+            }
+        }
+        SendSlot* slot = m_send_free;
+        m_send_free = slot->m_next;
+        slot->m_completion = IoCompletion{};
+        slot->m_completion.m_kind = WaitKind::Send;
+        return &slot->m_completion;
+    }
+
+    void release_send(IoCompletion* completion) noexcept {
+        auto* slot = reinterpret_cast<SendSlot*>(completion);
+        slot->m_next = m_send_free;
+        m_send_free = slot;
+    }
+
+    /* Take every CQE that is ready (user space only, no syscall) and resume
+    each waiting connection as its result is reaped, so it prepares its next
+    request right away; the next submit sends the whole batch.  The CQ is
+    advanced before any task runs. */
+    bool reap() noexcept {
+        SB_LAYER(Reap);
+        constexpr unsigned kBatch = 256;
+        io_uring_cqe* cqes[kBatch];
+        PromiseBase* tasks[kBatch];
+        io_uring& ring = m_ring->native_ring();
+        bool any = false;
+        for (;;) {
+            const unsigned count = io_uring_peek_batch_cqe(&ring, cqes, kBatch);
+            if (count == 0) break;
+            unsigned runnable = 0;
+            std::uint64_t now = 0;
+            for (unsigned i = 0; i < count; ++i) {
+                auto* completion = static_cast<IoCompletion*>(io_uring_cqe_get_data(cqes[i]));
+                if (completion == nullptr) continue;
+                if (completion->m_on_cqe != nullptr) {
+#if defined(SYSBENCH_TURNAROUND)
+                    if (m_reply_reaped == 0) m_reply_reaped = tsc_now();
+#endif
+                    const unsigned flags = cqes[i]->flags;
+                    if ((flags & IORING_CQE_F_MORE) == 0) --m_in_flight;
+                    if (PromiseBase* task = completion->m_on_cqe(completion, cqes[i]->res, flags))
+                        tasks[runnable++] = task;
+                    continue;
+                }
+                /* A zero-copy send posts its result (F_MORE: more to come)
+                and later a notification (F_NOTIF) when the kernel has let go
+                of the buffer: only the notification completes it. */
+                const unsigned cqe_flags = cqes[i]->flags;
+                if ((cqe_flags & IORING_CQE_F_MORE) != 0) {
+                    completion->m_result = cqes[i]->res;
+                    continue;
+                }
+                if ((cqe_flags & IORING_CQE_F_NOTIF) == 0) completion->m_result = cqes[i]->res;
+                completion->m_done = true;
+                --m_in_flight;
+#if defined(SYSBENCH_TURNAROUND)
+                if (completion->m_kind == WaitKind::Reply && m_reply_reaped == 0) m_reply_reaped = tsc_now();
+#endif
+                if (completion->m_issued != 0) {
+                    if (now == 0) now = tsc_now();
+                    observe_wait(completion->m_kind, now - completion->m_issued);
+                    --m_awaited[static_cast<unsigned>(completion->m_kind)];
+                    completion->m_issued = 0;
+                } else {
+                    --m_unawaited;
+                }
+                if (completion->m_orphan) {
+                    release_send(completion);
+                    continue;
+                }
+                if (completion->m_task != nullptr) tasks[runnable++] = completion->m_task;
+            }
+            io_uring_cq_advance(&ring, count);
+            SB_COUNT(Cqes, count);
+            m_runtime->m_progress.add_local(m_id, count);
+            any = true;
+            for (unsigned i = 0; i < runnable; ++i) resume(tasks[i]);
+        }
+        return any;
+    }
+
+    // One non-blocking kernel entry (only when there is something to submit or
+    // collect), then reap.
+    bool poll_io() noexcept {
+#if defined(SYSBENCH_TURNAROUND)
+        note_submit();
+#endif
+        if (m_ring->queued() != 0 || m_ring->task_work_pending()) m_ring->submit_and_collect();
+        return reap();
+    }
+
+    [[nodiscard]] bool have_work() const noexcept {
+        return m_ready_head != nullptr ||
+               m_injected.load(std::memory_order_acquire) != nullptr ||
+               m_exiting.load(std::memory_order_acquire);
+    }
+
+    [[nodiscard]] bool timer_due(Clock::time_point now) const noexcept {
+        return m_timer_head != nullptr && m_timer_head->m_wake_at <= now;
+    }
+
     void signal_wake() noexcept {
-        if (m_wake_fd < 0) return;
-        const std::uint64_t one = 1;
-        const ssize_t ignored = ::write(m_wake_fd, &one, sizeof(one));
-        (void)ignored;
+        m_wake_word.fetch_add(1, std::memory_order_seq_cst);
+        (void)::syscall(SYS_futex, reinterpret_cast<std::uint32_t*>(&m_wake_word),
+                        FUTEX_WAKE_PRIVATE, 1, nullptr, nullptr, 0);
     }
 
     void push_ready(PromiseBase* task) noexcept {
@@ -159,7 +393,11 @@ struct alignas(4096) Runtime::Worker {
         return task;
     }
 
-    void push_injected(PromiseBase* task) noexcept {
+    void wake_if_waiting() noexcept {
+        if (m_waiting.load(std::memory_order_seq_cst)) signal_wake();
+    }
+
+    void push_injected(PromiseBase* task, bool wake = true) noexcept {
         PromiseBase* head = m_injected.load(std::memory_order_relaxed);
         do {
             if (m_exiting.load(std::memory_order_relaxed)) return;
@@ -171,9 +409,7 @@ struct alignas(4096) Runtime::Worker {
         // where the worker stores waiting=true and loads the empty stack while
         // the producer pushes and loads waiting=false.  That loses the wakeup
         // and parks the worker forever with the task sitting in the stack.
-        if (m_waiting.load(std::memory_order_seq_cst)) {
-            signal_wake();
-        }
+        if (wake) wake_if_waiting();
     }
 
     void push_completed(PromiseBase* task) noexcept {
@@ -241,35 +477,108 @@ struct alignas(4096) Runtime::Worker {
     }
 
     void resume(PromiseBase* task) noexcept {
+        SB_LAYER(Coroutine);
+        SB_COUNT(Resumes, 1);
         detail::tls_worker = this;
         detail::tls_current = task;
         task->m_self.resume();
         detail::tls_current = nullptr;
-        m_runtime->m_resumes.add(m_id, 1);
+        m_runtime->m_resumes.add_local(m_id, 1);
     }
 
-    void wait_for_work() {
-        const auto now = Clock::now();
-        if (m_timer_head != nullptr && m_timer_head->m_wake_at <= now) return;
-
-        if (m_pending_io.load(std::memory_order_acquire) != 0 &&
-            m_runtime->undersubscribed()) {
-            const auto deadline = Clock::now() + kIdleSpin;
-            std::uint32_t spins = 0;
-            for (;;) {
-                if (m_injected.load(std::memory_order_acquire) != nullptr ||
-                    m_exiting.load(std::memory_order_acquire)) {
-                    return;
+    /* Nothing is runnable and every connection this worker owns is in
+    flight.  The scheduler spins for as long as the waits it is in should
+    take (expected_wait_cycles), then blocks in one kernel wait until a
+    completion, the next timer or a stall-check interval.  With NAPI the spin
+    is the kernel's busy poll of the sockets' NIC queues (so a reply is
+    processed on this CPU, not in an interrupt elsewhere); its length is
+    re-registered as the estimate moves.  Without it the spin polls the CQ
+    and the task-work flag from user space. */
+    void wait_io() noexcept {
+        /* The rule: spin only while the runtime is undersubscribed (no more
+        tasks than workers).  Oversubscribed, another task is always about to
+        be runnable, so a worker never spins: it blocks in one kernel wait that
+        also submits its batch. */
+        const bool may_spin = m_runtime->m_undersubscribed.load(std::memory_order_relaxed);
+        const std::uint64_t budget = may_spin ? expected_wait_cycles() : 0;
+        if (m_ring->napi_enabled()) {
+            const auto busy_us = static_cast<std::uint32_t>(
+                std::clamp<std::uint64_t>(cycles_to_ns(budget) / 1000, 1, 1'000'000));
+            /* Re-register only when the learned wait moved by over a quarter. */
+            if (busy_us > m_napi_us + m_napi_us / 4 || busy_us + busy_us / 4 < m_napi_us) {
+                if (m_ring->enable_napi(busy_us)) m_napi_us = busy_us;
+            }
+        } else if (may_spin) {
+            const std::uint64_t start = tsc_now();
+            for (std::uint32_t spins = 1;; ++spins) {
+                if (poll_io() || have_work()) return;
+                if ((spins & 63) == 0) {
+                    const std::uint64_t now = tsc_now();
+                    if (now - start >= budget) break;
+                    if (timer_due(Clock::now())) return;
                 }
-                // The wake sequence is checked on every pass so completion
-                // handoff latency stays in the hundreds of nanoseconds; the
-                // clock is sampled only periodically because the vDSO call is
-                // far more expensive than the check itself.
-                if ((++spins & 63) == 0 && Clock::now() >= deadline) break;
-                cpu_relax();
+                spin_pause();
             }
         }
+        auto limit = std::chrono::nanoseconds(std::chrono::milliseconds(50));
+        if (m_timer_head != nullptr) {
+            const auto now = Clock::now();
+            if (timer_due(now)) return;
+            limit = std::min(limit, std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                        m_timer_head->m_wake_at - now));
+        }
+        __kernel_timespec timeout{.tv_sec = static_cast<long long>(limit.count() / 1'000'000'000),
+                                  .tv_nsec = static_cast<long long>(limit.count() % 1'000'000'000)};
+        /* Wait for one completion more than there are unawaited sends in
+        flight: a send's CQE (posted the moment it is submitted) must not end
+        the wait for the reply, or every round trip takes a second syscall.
+        Everything posted earlier has been reaped, so the CQ starts empty. */
+#if defined(SYSBENCH_TURNAROUND)
+        note_submit();
+#endif
+        m_ring->submit_and_wait(&timeout, m_unawaited + 1);
+        /* The wait ran the completion work it needed; whatever else is
+        pending is collected by the next wait, not by another syscall. */
+        if (!(m_ring->napi_enabled() ? reap() : poll_io())) check_stall();
+    }
 
+    /* Idle (nothing in flight, nothing ready): one worker per NUMA node may
+    spin, for as long as a reply is expected to take, in case work arrives;
+    the others go straight to their futex. */
+    bool spin_idle() noexcept {
+        auto& spinner = m_runtime->m_idle_spinners[static_cast<std::size_t>(
+            std::max(0, m_numa_node)) % m_runtime->m_idle_spinners.size()].m_worker;
+        std::int32_t none = -1;
+        if (!spinner.compare_exchange_strong(none, static_cast<std::int32_t>(m_id),
+                                             std::memory_order_acq_rel)) {
+            return false;
+        }
+        const std::uint64_t budget = m_wait_cycles[static_cast<unsigned>(WaitKind::Reply)];
+        const std::uint64_t start = tsc_now();
+        bool woke = false;
+        for (std::uint32_t spins = 1;; ++spins) {
+            if (have_work()) {
+                woke = true;
+                break;
+            }
+            if ((spins & 63) == 0) {
+                if (tsc_now() - start >= budget) break;
+                if (timer_due(Clock::now())) {
+                    woke = true;
+                    break;
+                }
+            }
+            spin_pause();
+        }
+        spinner.store(-1, std::memory_order_release);
+        return woke;
+    }
+
+    /* Nothing in flight and nothing ready: only a new task, a timer or exit
+    can give this worker work.  Futex wait, no spin. */
+    void wait_idle() {
+        if (m_runtime->m_undersubscribed.load(std::memory_order_relaxed) && spin_idle()) return;
+        const std::uint32_t seen = m_wake_word.load(std::memory_order_seq_cst);
         m_waiting.store(true, std::memory_order_seq_cst);
         if (m_injected.load(std::memory_order_seq_cst) != nullptr ||
             m_exiting.load(std::memory_order_acquire)) {
@@ -277,26 +586,38 @@ struct alignas(4096) Runtime::Worker {
             return;
         }
 
-        int timeout_ms = -1;
+        timespec timeout{};
+        timespec* wait_for = nullptr;
+        const bool watch = m_runtime->m_stall_timeout > std::chrono::milliseconds(0) &&
+                           !m_runtime->stall_detected() &&
+                           m_runtime->m_outstanding.sum(m_runtime->m_worker_count) > 0;
+        if (watch) {
+            const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                m_runtime->m_stall_timeout).count();
+            timeout.tv_sec = static_cast<time_t>(ns / 1'000'000'000);
+            timeout.tv_nsec = static_cast<long>(ns % 1'000'000'000);
+            wait_for = &timeout;
+        }
         if (m_timer_head != nullptr) {
-            const auto timer_now = Clock::now();
-            if (m_timer_head->m_wake_at <= timer_now) {
+            const auto now = Clock::now();
+            if (timer_due(now)) {
                 m_waiting.store(false, std::memory_order_seq_cst);
                 return;
             }
-            const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
-                m_timer_head->m_wake_at - timer_now);
-            timeout_ms = static_cast<int>(std::max<std::int64_t>(1, remaining.count()));
+            const auto remaining = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                m_timer_head->m_wake_at - now);
+            timeout.tv_sec = static_cast<time_t>(remaining.count() / 1'000'000'000);
+            timeout.tv_nsec = static_cast<long>(remaining.count() % 1'000'000'000);
+            wait_for = &timeout;
         }
 
-        pollfd descriptor{.fd = m_wake_fd, .events = POLLIN, .revents = 0};
-        const int result = ::poll(&descriptor, 1, timeout_ms);
-        m_waiting.store(false, std::memory_order_release);
-        if (result > 0 && (descriptor.revents & POLLIN) != 0) {
-            std::uint64_t counter = 0;
-            const ssize_t ignored = ::read(m_wake_fd, &counter, sizeof(counter));
-            (void)ignored;
+        {
+            SB_LAYER(Idle);
+            (void)::syscall(SYS_futex, reinterpret_cast<std::uint32_t*>(&m_wake_word),
+                            FUTEX_WAIT_PRIVATE, seen, wait_for, nullptr, 0);
         }
+        m_waiting.store(false, std::memory_order_release);
+        if (watch) check_stall();
     }
 
     void request_exit() noexcept {
@@ -312,7 +633,15 @@ struct alignas(4096) Runtime::Worker {
         }
         set_thread_name(m_numa_node >= 0 ? "sb-worker-n" : "sb-worker");
         if (m_runtime->m_config.m_pin_workers) {
-            if (m_numa_node >= 0) {
+            /* One CPU per worker: the CPU decides the NIC TX queue (XPS), and
+            connections are steered so their replies come back on it. */
+            /* More workers than CPUs (blocking I/O runs one per connection):
+            pin them to their node and let the kernel balance them, as it
+            does sysbench's threads, instead of stacking two on one CPU. */
+            const bool oversubscribed = m_runtime->m_worker_count > Runtime::hardware_workers();
+            if (m_numa_node >= 0 && m_cpu >= 0 && !oversubscribed) {
+                set_thread_affinity(static_cast<std::uint32_t>(m_cpu));
+            } else if (m_numa_node >= 0) {
                 const numa::Topology& topology = numa::Topology::instance();
                 const numa::NodeInfo* info = topology.node_by_id(m_numa_node);
                 if (info != nullptr) {
@@ -331,26 +660,80 @@ struct alignas(4096) Runtime::Worker {
             } else {
                 set_thread_affinity(m_runtime->m_config.m_first_cpu + m_id);
             }
+        } else {
+            /* Unpinned: the kernel places the worker, on any CPU the process
+            started with but the main thread's.  Without this it would inherit
+            the main thread's single-CPU mask and every worker would share it. */
+            const numa::Topology& topology = numa::Topology::instance();
+            cpu_set_t set = topology.process_cpus();
+            if (topology.reserved_cpu() >= 0 && CPU_COUNT(&set) > 1) {
+                CPU_CLR(topology.reserved_cpu(), &set);
+            }
+            (void)::pthread_setaffinity_np(::pthread_self(), sizeof(set), &set);
+        }
+
+        layer::register_thread();
+        m_ring.emplace(m_runtime->m_config.m_ring_entries, IoRing::worker_flags());
+        for (auto& estimate : m_wait_cycles) estimate = ns_to_cycles(kInitialWaitNs);
+        m_ring->set_send_zc(m_runtime->m_config.m_send_zc);
+        m_ring->set_direct_send(m_runtime->m_config.m_direct_send || m_runtime->m_config.m_blocking_io);
+        if (m_runtime->m_config.m_busy_poll) {
+            m_napi_us = static_cast<std::uint32_t>(kInitialWaitNs / 1000);
+            if (!m_ring->enable_napi(m_napi_us)) m_napi_us = 0;
         }
 
         for (;;) {
             drain_injected();
             activate_due_timers();
+
+            /* Run every runnable task; each queues its SQEs in the ring.  A
+            long ready list is cut into batches so completions keep flowing. */
+            for (std::uint32_t ran = 0; ran < 512; ++ran) {
+                PromiseBase* task = pop_ready();
+                if (task == nullptr) break;
+                resume(task);
+            }
             process_completed();
             process_deferred();
 
-            if (PromiseBase* task = pop_ready()) {
-                resume(task);
-                continue;
+            /* Submit the batch and reap whatever has completed, resuming each
+            connection as its result comes in: no wait.  When the worker waits
+            in the kernel (NAPI), the wait itself submits the batch: one
+            io_uring_enter per round trip carries the send, the busy poll and
+            the receive, so here it only reaps what is already posted. */
+            if (m_ring->napi_enabled()) {
+                (void)reap();
+            } else {
+                (void)poll_io();
             }
-
+            /* Tasks resumed while reaping may have finished: retire them now,
+            or a worker could go idle holding the last outstanding task. */
+            process_completed();
+            process_deferred();
+            if (m_ready_head != nullptr) continue;
+            if (m_injected.load(std::memory_order_acquire) != nullptr) continue;
             if (m_exiting.load(std::memory_order_acquire)) break;
-            wait_for_work();
+            if (timer_due(Clock::now())) continue;
+
+            if (m_in_flight != 0) {
+                wait_io();
+            } else {
+                wait_idle();
+            }
         }
 
         drain_injected();
         process_completed();
         process_deferred();
+#if defined(SYSBENCH_TURNAROUND)
+        if (m_turnarounds != 0) {
+            std::fprintf(stderr, "worker %u turnaround: %.3f us per reply (%llu replies)\n", m_id,
+                         static_cast<double>(m_turnaround_cycles) / static_cast<double>(m_turnarounds) /
+                             g_cycles_per_ns / 1000.0,
+                         static_cast<unsigned long long>(m_turnarounds));
+        }
+#endif
+        m_ring.reset();
         detail::tls_worker = nullptr;
     }
 };
@@ -373,15 +756,9 @@ void Runtime::start(const Config& config_input) {
     if (config.m_worker_heap_bytes < 1024 * 1024) config.m_worker_heap_bytes = 1024 * 1024;
     m_config = config;
     m_worker_count = config.m_workers;
+    calibrate_tsc();
     m_stall_timeout = config.m_stall_timeout;
     m_stall_detected.store(false, std::memory_order_release);
-    m_last_outstanding = -1;
-    m_idle_since = Clock::now();
-    m_wait_event_fd = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-    if (m_wait_event_fd < 0) {
-        m_worker_count = 0;
-        throw std::system_error(errno, std::generic_category(), "eventfd");
-    }
 
     m_worker_storage =
         mem::global_root().allocate(sizeof(Worker) * m_worker_count, alignof(Worker));
@@ -401,6 +778,12 @@ void Runtime::start(const Config& config_input) {
             }
             ::new (static_cast<void*>(m_workers + constructed))
                 Worker(this, constructed, m_config, node, cpu);
+            {
+                std::uint32_t on_node = 0;
+                for (std::uint32_t other = 0; other < constructed; ++other)
+                    if (m_workers[other].m_numa_node == node) ++on_node;
+                m_workers[constructed].m_node_index = on_node;
+            }
             if (use_numa) (void)numa::set_preferred(topology.home_node());
         }
     } catch (...) {
@@ -411,10 +794,6 @@ void Runtime::start(const Config& config_input) {
         m_workers = nullptr;
         m_worker_storage = nullptr;
         m_worker_count = 0;
-        if (m_wait_event_fd >= 0) {
-            ::close(m_wait_event_fd);
-            m_wait_event_fd = -1;
-        }
         throw;
     }
 
@@ -441,22 +820,15 @@ void Runtime::start(const Config& config_input) {
         m_workers = nullptr;
         m_worker_storage = nullptr;
         m_worker_count = 0;
-        if (m_wait_event_fd >= 0) {
-            ::close(m_wait_event_fd);
-            m_wait_event_fd = -1;
-        }
         throw;
     }
 
     m_running.store(true, std::memory_order_release);
 }
 
+
 void Runtime::shutdown() {
     if (m_workers == nullptr) {
-        if (m_wait_event_fd >= 0) {
-            ::close(m_wait_event_fd);
-            m_wait_event_fd = -1;
-        }
         return;
     }
     m_running.store(false, std::memory_order_release);
@@ -472,22 +844,6 @@ void Runtime::shutdown() {
     m_worker_storage = nullptr;
     m_worker_count = 0;
 
-    // Ask any remaining runtime-owned threads to stop, then join them.  Worker
-    // threads are already joined, so no new threads can be registered now.
-    for (ThreadSlot& slot : m_thread_slots) {
-        if (slot.m_key.load(std::memory_order_acquire) == 0) continue;
-        if (slot.m_stop != nullptr) slot.m_stop(slot.m_argument);
-    }
-    for (ThreadSlot& slot : m_thread_slots) {
-        if (slot.m_key.load(std::memory_order_acquire) == 0) continue;
-        if (slot.m_thread.joinable()) slot.m_thread.join();
-        slot.m_key.store(0, std::memory_order_release);
-    }
-
-    if (m_wait_event_fd >= 0) {
-        ::close(m_wait_event_fd);
-        m_wait_event_fd = -1;
-    }
 }
 
 Runtime::~Runtime() {
@@ -536,143 +892,66 @@ int Runtime::spawn_numa_node(std::uint32_t worker) const {
     return m_workers[worker].m_numa_node;
 }
 
-void Runtime::note_io_submitted() noexcept {
+
+IoRing* Runtime::current_ring() noexcept {
     auto* worker = static_cast<Worker*>(detail::tls_worker);
-    if (worker != nullptr) worker->m_pending_io.fetch_add(1, std::memory_order_relaxed);
+    return worker != nullptr && worker->m_ring ? &*worker->m_ring : nullptr;
 }
 
-void Runtime::note_io_completed(std::uint32_t worker) noexcept {
-    if (m_workers == nullptr || worker >= m_worker_count) return;
-    // Release so a worker that reads zero pending operations is guaranteed to
-    // observe the completion that was posted just before the decrement.
-    m_workers[worker].m_pending_io.fetch_sub(1, std::memory_order_release);
+void Runtime::io_issued(IoCompletion* completion) noexcept {
+    auto* worker = static_cast<Worker*>(detail::tls_worker);
+    if (worker == nullptr) detail::no_runtime();
+    worker->issued(completion);
 }
 
-void Runtime::post_completion(std::uint32_t worker,
-                              detail::PromiseBase* task) noexcept {
-    if (task == nullptr || m_workers == nullptr || worker >= m_worker_count ||
-        !m_running.load(std::memory_order_acquire)) {
-        return;
-    }
-    m_workers[worker].push_injected(task);
-}
-
-bool Runtime::start_thread(const ThreadSpec& spec) {
-    if (spec.m_key == nullptr || spec.m_body == nullptr) return false;
-    const std::uintptr_t key = reinterpret_cast<std::uintptr_t>(spec.m_key);
-    for (ThreadSlot& slot : m_thread_slots) {
-        std::uintptr_t expected = 0;
-        if (!slot.m_key.compare_exchange_strong(expected, key,
-                                              std::memory_order_acq_rel)) {
-            continue;
-        }
-        slot.m_body = spec.m_body;
-        slot.m_stop = spec.m_stop;
-        slot.m_argument = spec.m_argument;
-        slot.m_thread = std::thread([&slot] { (void)slot.m_body(slot.m_argument); });
-        return true;
-    }
-    return false;
-}
-
-void Runtime::join_thread(const void* key) {
-    const std::uintptr_t wanted = reinterpret_cast<std::uintptr_t>(key);
-    for (ThreadSlot& slot : m_thread_slots) {
-        if (slot.m_key.load(std::memory_order_acquire) != wanted) continue;
-        if (slot.m_thread.joinable()) slot.m_thread.join();
-        slot.m_key.store(0, std::memory_order_release);
-        return;
+void Runtime::wait_started(IoCompletion* completion) noexcept {
+    auto* worker = static_cast<Worker*>(detail::tls_worker);
+    if (worker == nullptr) detail::no_runtime();
+    if (completion->m_issued == 0) {
+        completion->m_issued = tsc_now();
+        ++worker->m_awaited[static_cast<unsigned>(completion->m_kind)];
     }
 }
 
-bool Runtime::start_reaper(IoReaper& reaper) {
-    ThreadSpec spec;
-    spec.m_key = &reaper;
-    spec.m_body = [](void* context) -> void* {
-        auto* target = static_cast<IoReaper*>(context);
-        target->runtime().reaper_loop(*target);
-        return nullptr;
-    };
-    spec.m_stop = [](void* context) {
-        static_cast<IoReaper*>(context)->request_stop();
-    };
-    spec.m_argument = &reaper;
-    return start_thread(spec);
+void Runtime::wait_finished(IoCompletion* completion) noexcept {
+    auto* worker = static_cast<Worker*>(detail::tls_worker);
+    if (worker == nullptr || completion->m_issued == 0) return;
+    worker->observe_wait(completion->m_kind, tsc_now() - completion->m_issued);
+    --worker->m_awaited[static_cast<unsigned>(completion->m_kind)];
+    completion->m_issued = 0;
 }
 
-void Runtime::stop_reaper(IoReaper& reaper) {
-    join_thread(&reaper);
+IoCompletion* Runtime::acquire_send_completion() {
+    auto* worker = static_cast<Worker*>(detail::tls_worker);
+    if (worker == nullptr) detail::no_runtime();
+    return worker->acquire_send();
 }
 
-void Runtime::reaper_loop(IoReaper& reaper) noexcept {
-    reaper.pin();
-    while (reaper.running()) {
-        if (reaper.reap()) continue;
-
-        // Undersubscribed: a bounded spin is cheaper than a kernel sleep/wake
-        // for a completion that is likely imminent.  Oversubscribed: every
-        // cycle spent here is a cycle a runnable task (on any socket) does
-        // not get, so block instead and let the scheduler run that task.
-        if (undersubscribed()) {
-            const auto deadline = Clock::now() + kIdleSpin;
-            std::uint32_t spins = 0;
-            bool ready = false;
-            for (;;) {
-                if (!reaper.running()) return;
-                if ((++spins & 63) == 0 && Clock::now() >= deadline) break;
-                if (reaper.reap()) {
-                    ready = true;
-                    break;
-                }
-                cpu_relax();
-            }
-            if (ready) continue;
-        }
-
-        if (!reaper.wait()) break;
-    }
+void Runtime::release_send_completion(IoCompletion* completion) noexcept {
+    auto* worker = static_cast<Worker*>(detail::tls_worker);
+    if (worker == nullptr) detail::no_runtime();
+    worker->release_send(completion);
 }
 
 void Runtime::finish_task() noexcept {
     auto* worker = static_cast<Worker*>(detail::tls_worker);
     const std::uint32_t worker_id = worker != nullptr ? worker->m_id : 0;
     m_outstanding.add(worker_id, -1);
+    m_progress.add(worker_id, 1);
     const std::uint32_t active = m_active_tasks.fetch_sub(1, std::memory_order_relaxed) - 1;
     m_undersubscribed.store(active <= m_worker_count, std::memory_order_relaxed);
-    if (m_wait_event_fd >= 0 && m_outstanding.sum(m_worker_count) == 0) {
-        const std::uint64_t one = 1;
-        const ssize_t ignored = ::write(m_wait_event_fd, &one, sizeof(one));
-        (void)ignored;
+    if (m_outstanding.sum(m_worker_count) == 0) {
+        m_wait_word.fetch_add(1, std::memory_order_seq_cst);
+        (void)::syscall(SYS_futex, reinterpret_cast<std::uint32_t*>(&m_wait_word),
+                        FUTEX_WAKE_PRIVATE, INT32_MAX, nullptr, nullptr, 0);
     }
 }
 
-bool Runtime::check_stall(std::int64_t outstanding) {
-    if (outstanding <= 0) return false;
-
-    const auto now = Clock::now();
-
-    // Resumes is sharded per worker: counting it here costs nothing on the
-    // hot path, where a shared counter incremented around every resume is a
-    // cache line every worker fights over.
-    const auto resumes = m_resumes.sum(m_worker_count);
-
-    if (outstanding != m_last_outstanding || resumes != m_last_resumes) {
-        m_last_outstanding = outstanding;
-        m_last_resumes = resumes;
-        m_idle_since = now;
-        return false;
-    }
-
-    if (m_stall_timeout <= std::chrono::milliseconds(0) ||
-        now - m_idle_since < m_stall_timeout)
-        return false;
-
-    if (m_stall_detected.exchange(true, std::memory_order_acq_rel)) return true;
-
-    const auto stalled_for = std::chrono::duration_cast<std::chrono::milliseconds>(
-        now - m_idle_since);
-    const auto stalled_ms = stalled_for.count();
-
+void Runtime::declare_stall(std::int64_t outstanding,
+                            std::chrono::steady_clock::duration stalled) noexcept {
+    if (m_stall_detected.exchange(true, std::memory_order_acq_rel)) return;
+    const auto stalled_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(stalled).count();
     if (stalled_ms >= 1000) {
         std::println(stderr,
                      "sysbench: no progress for {}s with {} task(s) "
@@ -684,32 +963,21 @@ bool Runtime::check_stall(std::int64_t outstanding) {
                      "outstanding; a server connection appears to have stalled",
                      stalled_ms, outstanding);
     }
-    return true;
+    m_wait_word.fetch_add(1, std::memory_order_seq_cst);
+    (void)::syscall(SYS_futex, reinterpret_cast<std::uint32_t*>(&m_wait_word),
+                    FUTEX_WAKE_PRIVATE, INT32_MAX, nullptr, nullptr, 0);
 }
 
+/* The caller only blocks: the workers detect a stall and finish_task() wakes
+it when the last task ends.  No polling and no coordination here. */
 bool Runtime::wait() {
-    // A task suspended on a completion the server will never send leaves
-    // m_outstanding above zero forever.  Report that instead of sleeping in
-    // poll() indefinitely: if no worker is running and the outstanding count
-    // has not moved for the stall timeout, the connection is stalled.
-    constexpr auto slice = std::chrono::milliseconds(200);
-
     for (;;) {
         if (m_workers == nullptr) return true;
-
-        const std::int64_t outstanding = m_outstanding.sum(m_worker_count);
-
-        if (outstanding <= 0) return true;
-        if (check_stall(outstanding)) return false;
-
-        pollfd descriptor{.fd = m_wait_event_fd, .events = POLLIN, .revents = 0};
-        const int result =
-            ::poll(&descriptor, 1, static_cast<int>(slice.count()));
-        if (result > 0 && (descriptor.revents & POLLIN) != 0) {
-            std::uint64_t counter = 0;
-            const ssize_t ignored = ::read(m_wait_event_fd, &counter, sizeof(counter));
-            (void)ignored;
-        }
+        const std::uint32_t seen = m_wait_word.load(std::memory_order_seq_cst);
+        if (m_outstanding.sum(m_worker_count) <= 0) return true;
+        if (stall_detected()) return false;
+        (void)::syscall(SYS_futex, reinterpret_cast<std::uint32_t*>(&m_wait_word),
+                        FUTEX_WAIT_PRIVATE, seen, nullptr, nullptr, 0);
     }
 }
 
@@ -717,28 +985,15 @@ bool Runtime::wait_for(std::chrono::nanoseconds timeout) {
     const auto deadline = Clock::now() + timeout;
     for (;;) {
         if (m_workers == nullptr) return true;
-
-        const std::int64_t outstanding = m_outstanding.sum(m_worker_count);
-
-        if (outstanding <= 0) return true;
-
-        // A stall ends the wait as if the work were done; the caller checks
-        // stall_detected() and reports the failure.
-        if (check_stall(outstanding)) return true;
-
+        const std::uint32_t seen = m_wait_word.load(std::memory_order_seq_cst);
+        if (m_outstanding.sum(m_worker_count) <= 0 || stall_detected()) return true;
         const auto now = Clock::now();
         if (now >= deadline) return false;
-        const auto remaining =
-            std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
-        const int timeout_ms =
-            static_cast<int>(std::max<std::int64_t>(1, remaining.count()));
-        pollfd descriptor{.fd = m_wait_event_fd, .events = POLLIN, .revents = 0};
-        const int result = ::poll(&descriptor, 1, timeout_ms);
-        if (result > 0 && (descriptor.revents & POLLIN) != 0) {
-            std::uint64_t counter = 0;
-            const ssize_t ignored = ::read(m_wait_event_fd, &counter, sizeof(counter));
-            (void)ignored;
-        }
+        const auto left = std::chrono::duration_cast<std::chrono::nanoseconds>(deadline - now);
+        timespec slice{static_cast<time_t>(left.count() / 1'000'000'000),
+                       static_cast<long>(left.count() % 1'000'000'000)};
+        (void)::syscall(SYS_futex, reinterpret_cast<std::uint32_t*>(&m_wait_word),
+                        FUTEX_WAIT_PRIVATE, seen, &slice, nullptr, 0);
     }
 }
 
@@ -780,6 +1035,13 @@ std::uint64_t Runtime::resumes() const noexcept {
 
 std::uint32_t Runtime::numa_node_count() const noexcept {
     return numa::Topology::instance().node_count();
+}
+
+std::uint32_t Runtime::worker_node_index(std::uint32_t worker) const {
+    if (m_workers == nullptr || worker >= m_worker_count) {
+        throw std::out_of_range("worker id");
+    }
+    return m_workers[worker].m_node_index;
 }
 
 int Runtime::worker_numa_node(std::uint32_t worker) const {

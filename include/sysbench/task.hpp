@@ -115,23 +115,24 @@ public:
         return m_handle;
     }
 
+    /* The child is suspended at its final suspend point (it handed control
+    back here by symmetric transfer), so its frame is destroyed right away:
+    the frame goes back to this thread's free list at once, whether or not
+    the task ever returns to the scheduler loop. */
     decltype(auto) await_resume() {
         auto& promise = m_handle.promise();
         if (promise.m_error) {
             std::exception_ptr error = promise.m_error;
-            detail::defer_destroy(&promise);
-            m_handle = {};
+            std::exchange(m_handle, {}).destroy();
             std::rethrow_exception(error);
         }
         using Value = typename T::Value;
         if constexpr (!std::is_void_v<Value>) {
             Value value = std::move(*promise.m_value);
-            detail::defer_destroy(&promise);
-            m_handle = {};
+            std::exchange(m_handle, {}).destroy();
             return value;
         } else {
-            detail::defer_destroy(&promise);
-            m_handle = {};
+            std::exchange(m_handle, {}).destroy();
         }
     }
 

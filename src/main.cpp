@@ -21,6 +21,7 @@
 #include "sysbench/numa.hpp"
 #include "sysbench/options.hpp"
 #include "sysbench/runtime.hpp"
+#include "sysbench/socket_io.hpp"
 
 #include <algorithm>
 #include <csignal>
@@ -73,23 +74,41 @@ struct MemoryDefaults {
 
 MemoryDefaults prescan_memory(int argc, char** argv) {
     MemoryDefaults result;
+    bool explicit_size = false;
+    std::uint64_t threads = 1;
+    std::uint64_t connection_heap = (1024ull + 64) * 1024;
+    const auto value_of = [&](int& i, std::string_view argument,
+                              std::string_view name) -> std::string_view {
+        if (argument.starts_with(name) && argument.size() > name.size() &&
+            argument[name.size()] == '=') {
+            return argument.substr(name.size() + 1);
+        }
+        if (argument == name && i + 1 < argc) return std::string_view(argv[++i]);
+        return {};
+    };
     for (int i = 1; i < argc; ++i) {
         const std::string_view argument(argv[i]);
+        std::uint64_t parsed = 0;
         if (argument == "--populate-memory") {
             result.m_populate = true;
-        } else if (argument.starts_with("--memory-size=")) {
-            std::uint64_t parsed = 0;
-            if (sb::Options::parse_size_value(argument.substr(14), parsed) &&
-                parsed > 0) {
+        } else if (auto v = value_of(i, argument, "--memory-size"); !v.empty()) {
+            if (sb::Options::parse_size_value(v, parsed) && parsed > 0) {
                 result.m_bytes = parsed;
+                explicit_size = true;
             }
-        } else if (argument == "--memory-size" && i + 1 < argc) {
-            std::uint64_t parsed = 0;
-            if (sb::Options::parse_size_value(argv[i + 1], parsed) && parsed > 0) {
-                result.m_bytes = parsed;
-            }
-            ++i;
+        } else if (auto t = value_of(i, argument, "--threads"); !t.empty()) {
+            if (sb::Options::parse_size_value(t, parsed) && parsed > 0) threads = parsed;
+        } else if (auto h = value_of(i, argument, "--lua-heap-size"); !h.empty()) {
+            if (sb::Options::parse_size_value(h, parsed) && parsed > 0)
+                connection_heap = parsed + 64 * 1024;
         }
+    }
+    /* The reservation is address space (MAP_NORESERVE), so without an explicit
+    size it simply covers every connection's heap plus the workers. */
+    if (!explicit_size) {
+        const std::uint64_t needed =
+            threads * (connection_heap + 96 * 1024) * 5 / 4 + 4ull * 1024 * 1024 * 1024;
+        result.m_bytes = std::max(result.m_bytes, needed);
     }
     if (result.m_bytes < 64ull * 1024 * 1024) result.m_bytes = 64ull * 1024 * 1024;
     return result;
@@ -204,17 +223,46 @@ int main(int argc, char** argv) {
 
     const std::uint32_t workers_setting = static_cast<std::uint32_t>(
         std::max<std::int64_t>(0, options.as_int("workers", 0)));
+    /* Each worker owns an io_uring and its share of the connections: it runs
+    their events, submits and reaps in batches.  The worker count follows the
+    connection count: one worker per --connections-per-worker connections, at
+    most one per CPU (and the runtime's limit).  --workers overrides it. */
+    /* --io-blocking: sysbench's network architecture.  A blocking
+    recv() holds its thread, so each connection gets its own worker. */
+    bool blocking_io = options.as_bool("io-blocking", true);
+    /* A blocking connection holds a worker, and there are at most kMaxWorkers:
+    past that, many connections must share a worker, which only the io_uring
+    architecture can do. */
+    if (blocking_io && threads > sb::Runtime::kMaxWorkers) {
+        std::println(stderr,
+                     "sysbench: {} connections exceed {} blocking workers; using the io_uring architecture",
+                     threads, sb::Runtime::kMaxWorkers);
+        blocking_io = false;
+    }
+    const std::uint32_t per_worker = blocking_io ? 1u : static_cast<std::uint32_t>(
+        std::max<std::int64_t>(1, options.as_int("connections-per-worker", 2)));
+    const std::uint32_t cpus = std::max<std::uint32_t>(1, sb::Runtime::hardware_workers());
+    /* Blocking I/O holds a worker per connection, so its count is the
+    connection count even past the CPU count (as sysbench runs a thread each). */
     std::uint32_t workers =
         workers_setting != 0
             ? workers_setting
-            : std::min<std::uint32_t>(threads, sb::Runtime::hardware_workers());
+            : blocking_io ? std::max<std::uint32_t>(1, threads)
+                          : std::min<std::uint32_t>(cpus, (std::max<std::uint32_t>(1, threads) +
+                                                           per_worker - 1) / per_worker);
     if (workers > sb::Runtime::kMaxWorkers) {
-        std::println(stderr, "sysbench: --workers capped at {}",
-                     sb::Runtime::kMaxWorkers);
+        if (workers_setting != 0) {
+            std::println(stderr, "sysbench: --workers capped at {}",
+                         sb::Runtime::kMaxWorkers);
+        }
         workers = sb::Runtime::kMaxWorkers;
     }
-    const std::uint64_t io_bytes =
-        static_cast<std::uint64_t>(threads) * 96 * 1024;
+    const std::uint64_t lua_heap_bytes = std::max<std::uint64_t>(
+        1024, options.as_size("lua-heap-size", 1024ull * 1024));
+    const std::uint64_t connection_heap_bytes = std::max<std::uint64_t>(
+        1024, options.as_size("connection-heap-size", 8 * 1024));
+    const std::uint64_t io_bytes = static_cast<std::uint64_t>(threads) *
+                                   (96 * 1024 + lua_heap_bytes + connection_heap_bytes);
     const std::uint64_t worker_heap_bytes =
         choose_worker_heap(root.capacity(), main_heap_bytes, workers, io_bytes);
     const std::uint64_t required =
@@ -243,7 +291,15 @@ int main(int argc, char** argv) {
     database.m_password = password;
     database.m_database = database_name;
     database.m_socket_path = socket_path;
+    const auto protocol_version = options.as_int("mysql-protocol", 1);
+    if (protocol_version != 1 && protocol_version != 2) {
+        std::println(stderr, "sysbench: --mysql-protocol must be 1 or 2");
+        sb::mem::destroy(main_heap, engine);
+        return EXIT_FAILURE;
+    }
+    database.m_protocol_version = static_cast<std::uint32_t>(protocol_version);
     database.m_connect_timeout_ms = 5000;
+    database.m_steer_rx = options.as_bool("nic-steering", false) && options.as_bool("pin-workers", true);
     const auto ssl_mode = options.as_string("mysql-ssl", "off");
     if (ssl_mode == "on" || ssl_mode == "required") {
         database.m_tls_mode = sb::db::TlsMode::Required;
@@ -277,6 +333,8 @@ int main(int argc, char** argv) {
     run_options.m_percentile = static_cast<std::uint32_t>(
         std::clamp<std::int64_t>(options.as_int("percentile", 95), 0, 100));
     run_options.m_histogram = options.as_bool("histogram", false);
+    run_options.m_lua_heap_bytes = lua_heap_bytes;
+    run_options.m_connection_heap_bytes = connection_heap_bytes;
     const std::int64_t seed = options.as_int("seed", 0) != 0
                                   ? options.as_int("seed", 0)
                                   : options.as_int("rand-seed", 0);
@@ -292,6 +350,20 @@ int main(int argc, char** argv) {
         return result;
     }
 
+    /* --io-busy-poll=auto follows the host: with
+    net.core.busy_read set, every blocking recv() on this host busy-polls the
+    NIC (that is what a blocking client gets without asking); io_uring receives
+    get the same only through NAPI busy polling, so turn that on. */
+    const auto busy_poll_mode = options.as_string("io-busy-poll", "off");
+    bool busy_poll = busy_poll_mode == "on";
+    if (busy_poll_mode == "auto") {
+        if (FILE* file = std::fopen("/proc/sys/net/core/busy_read", "r")) {
+            int usec = 0;
+            busy_poll = std::fscanf(file, "%d", &usec) == 1 && usec > 0;
+            std::fclose(file);
+        }
+    }
+
     sb::Runtime runtime;
     try {
         runtime.start(sb::Runtime::Config{
@@ -300,7 +372,12 @@ int main(int argc, char** argv) {
             .m_pin_workers = pin_workers,
             .m_numa_aware = numa_enabled,
             .m_first_cpu = 0,
-            .m_stall_timeout = std::chrono::milliseconds(stall_seconds * 1000)});
+            .m_stall_timeout = std::chrono::milliseconds(stall_seconds * 1000),
+            .m_busy_poll = busy_poll,
+            .m_send_zc = options.as_bool("io-send-zc", false),
+            .m_multishot_receive = options.as_bool("io-multishot-recv", true),
+            .m_direct_send = options.as_bool("io-direct-send", false),
+            .m_blocking_io = blocking_io});
     } catch (const std::exception& failure) {
         std::println(stderr, "sysbench: cannot start runtime: {}", failure.what());
         sb::mem::destroy(main_heap, engine);

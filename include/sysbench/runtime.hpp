@@ -20,6 +20,7 @@
 #include "sysbench/sharded_counter.hpp"
 #include "sysbench/task.hpp"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -31,32 +32,21 @@
 
 namespace sb {
 
-// A source of I/O completions serviced by the Runtime.  Implementations only
-// report readiness and block; every spin, yield and sleep decision is made by
-// the Runtime's scheduler, which starts and runs the reaper thread.
+struct IoCompletion;
+class IoRing;
+
 class Runtime;
 
-class IoReaper {
-public:
-    virtual ~IoReaper() = default;
-    [[nodiscard]] virtual bool running() const noexcept = 0;
-    // Drain all completions currently available.  Returns true if any.
-    virtual bool reap() noexcept = 0;
-    // Block until a completion or shutdown.  Returns false to stop reaping.
-    virtual bool wait() noexcept = 0;
-    // Called once on the reaper thread before the loop starts.
-    virtual void pin() noexcept {}
-    // Asked by the Runtime when it shuts down; must make wait() return and
-    // running() report false.
-    virtual void request_stop() noexcept = 0;
-    [[nodiscard]] virtual Runtime& runtime() noexcept = 0;
-};
 
 // The Runtime owns every worker thread and every scheduling decision.  Tasks
-// are pinned to a worker (no work stealing) because their registered io_uring
-// buffers, Lua states and scoped arenas are thread-affine.  Incoming work is
-// handed off through a lock-free power-of-two injection ring; once running, a
-// task's continuations use intrusive queues and symmetric transfer only.
+// are pinned to a worker (no work stealing) because their sockets, Lua states
+// and scoped arenas are thread-affine.
+//
+// Each worker owns one io_uring.  It runs every runnable task (each queues its
+// SQEs in the ring), submits the batch and collects completed work in one
+// non-blocking kernel entry, reaps the CQE batch and resumes those tasks.  It
+// blocks in io_uring only when nothing is runnable and every connection it owns
+// is in flight, and then only after a spin of 1.2x its tracked round trip.
 class Runtime {
 public:
     static constexpr std::uint32_t kMaxWorkers = 64;
@@ -71,6 +61,26 @@ public:
         // running before it reports a stalled connection and returns.  Zero
         // waits forever.
         std::chrono::milliseconds m_stall_timeout{60000};
+        // Submission queue entries of each worker's io_uring.
+        std::uint32_t m_ring_entries = 4096;
+        // Where a worker's wait-for-completion spin runs.  On: in the kernel,
+        // as NAPI busy polling (the worker polls its sockets' NIC queues, so
+        // each reply is processed on its CPU).  Off: in user space, polling
+        // the completion queue.  Either way the spin is the scheduler's, and
+        // its length is learned from the waits the worker observes.
+        bool m_busy_poll = false;
+        // Posted sends use zero-copy IORING_OP_SEND_ZC.
+        bool m_send_zc = false;
+        // Sockets receive through a multishot receive armed once (provided
+        // buffers) instead of one receive request per read.
+        bool m_multishot_receive = true;
+        // Sends with nothing in flight on their socket go out as a direct
+        // non-blocking send() instead of a ring request.
+        bool m_direct_send = false;
+        // sysbench's network architecture: blocking send() and recv()
+        // on blocking sockets (recv busy-polls through net.core.busy_read),
+        // one connection per worker.  A task never suspends on the network.
+        bool m_blocking_io = false;
     };
 
     Runtime() = default;
@@ -87,10 +97,22 @@ public:
     // from this point on and destroys it when it completes.
     void spawn(Task<void>&& task);
     void spawn_on(std::uint32_t worker, Task<void>&& task);
-    void post_completion(std::uint32_t worker,
-                         detail::PromiseBase* task) noexcept;
-    static void note_io_submitted() noexcept;
-    void note_io_completed(std::uint32_t worker) noexcept;
+    [[nodiscard]] bool multishot_receive() const noexcept { return m_config.m_multishot_receive; }
+    [[nodiscard]] bool busy_poll() const noexcept { return m_config.m_busy_poll; }
+    [[nodiscard]] bool blocking_io() const noexcept { return m_config.m_blocking_io; }
+    // The calling worker's io_uring (nullptr off a worker thread).
+    [[nodiscard]] static IoRing* current_ring() noexcept;
+    // The calling worker has queued an SQE whose CQE carries `completion`.
+    static void io_issued(IoCompletion* completion) noexcept;
+    // Completion records for sends nobody awaits, owned by the calling worker
+    // (not by the connection), so a connection can close with sends in flight
+    // without waiting: it orphans them and the reaper takes them back.
+    // A task starts / stops waiting on a request that was issued earlier
+    // (a multishot receive): the wait is timed like an awaited request.
+    static void wait_started(IoCompletion* completion) noexcept;
+    static void wait_finished(IoCompletion* completion) noexcept;
+    [[nodiscard]] static IoCompletion* acquire_send_completion();
+    static void release_send_completion(IoCompletion* completion) noexcept;
 
     // Factory form: the coroutine frame is allocated while the calling thread's
     // frame pool is temporarily switched to the target worker's NUMA node.
@@ -150,6 +172,8 @@ public:
     [[nodiscard]] std::uint64_t resumes() const noexcept;
     [[nodiscard]] std::uint32_t numa_node_count() const noexcept;
     [[nodiscard]] int worker_numa_node(std::uint32_t worker) const;
+    // The worker's ID among its NUMA node's workers, assigned at creation.
+    [[nodiscard]] std::uint32_t worker_node_index(std::uint32_t worker) const;
     [[nodiscard]] int worker_cpu(std::uint32_t worker) const;
 
     [[nodiscard]] mem::MemoryResource& worker_allocator(std::uint32_t worker);
@@ -160,36 +184,21 @@ public:
     static mem::MemoryResource& current_allocator();
     static std::uint32_t hardware_workers() noexcept;
 
-    // Runtime-owned threads.  Every thread in the process is created, tracked
-    // and joined by the Runtime; callers only supply a body and an optional
-    // stop hook used during shutdown.
-    struct ThreadSpec {
-        const void* m_key = nullptr;
-        void* (*m_body)(void*) = nullptr;
-        void (*m_stop)(void*) = nullptr;
-        void* m_argument = nullptr;
-    };
-    [[nodiscard]] bool start_thread(const ThreadSpec& spec);
-    void join_thread(const void* key);
-
-    // A reaper thread whose wait policy (spin while undersubscribed, block
-    // otherwise) is owned by the Runtime scheduler.
-    [[nodiscard]] bool start_reaper(IoReaper& reaper);
-    void stop_reaper(IoReaper& reaper);
-
     // Opaque implementation type (public only so the runtime's free scheduling
     // hooks can name it; its definition is private to runtime.cpp).
     struct Worker;
 
 private:
     friend struct Worker;
-    void reaper_loop(IoReaper& reaper) noexcept;
+
     void finish_task() noexcept;
     [[nodiscard]] int spawn_numa_node(std::uint32_t worker) const;
     [[nodiscard]] std::uint32_t choose_worker() noexcept;
     // @return true when the outstanding tasks have made no progress for the
     // stall timeout; prints the error once.
-    [[nodiscard]] bool check_stall(std::int64_t outstanding);
+    // Called by a worker that has seen no progress for the stall timeout.
+    void declare_stall(std::int64_t outstanding,
+                       std::chrono::steady_clock::duration stalled) noexcept;
 
     Worker* m_workers = nullptr;
     void* m_worker_storage = nullptr;
@@ -197,26 +206,22 @@ private:
     Config m_config{};
     std::atomic<bool> m_running{false};
     std::atomic<bool> m_stop_requested{false};
-    static constexpr std::uint32_t kMaxThreads = 16384;
-    struct ThreadSlot {
-        std::atomic<std::uintptr_t> m_key{0};
-        void* (*m_body)(void*) = nullptr;
-        void (*m_stop)(void*) = nullptr;
-        void* m_argument = nullptr;
-        std::thread m_thread;
-    };
-    ThreadSlot m_thread_slots[kMaxThreads];
-
     ShardedCounter<std::int64_t, kMaxWorkers> m_outstanding;
     ShardedCounter<std::uint64_t, kMaxWorkers> m_resumes;
     std::atomic<std::uint32_t> m_active_tasks{0};
     std::atomic<bool> m_undersubscribed{true};
     std::chrono::milliseconds m_stall_timeout{0};
-    std::int64_t m_last_outstanding{-1};
-    std::uint64_t m_last_resumes{0};
-    std::chrono::steady_clock::time_point m_idle_since{};
+    // Completions and finished tasks: what the workers' stall check watches.
+    ShardedCounter<std::uint64_t, kMaxWorkers> m_progress;
     std::atomic<bool> m_stall_detected{false};
-    int m_wait_event_fd = -1;
+    // Futex word the waiting main thread sleeps on; bumped when all tasks finish.
+    std::atomic<std::uint32_t> m_wait_word{0};
+    // Per NUMA node, the one idle worker allowed to spin (-1: none); the
+    // others go straight to their futex.
+    struct alignas(64) IdleSpinner {
+        std::atomic<std::int32_t> m_worker{-1};
+    };
+    std::array<IdleSpinner, 64> m_idle_spinners{};
 };
 
 }  // namespace sb

@@ -110,7 +110,13 @@ class HeapArena final : public MemoryResource {
 public:
     static constexpr std::size_t kMinBlock = 64;
     static constexpr std::size_t kMaxAlignment = 4096;
-    static constexpr std::size_t kBinCount = 40;
+    /* Free lists (two-level segregated fit): blocks below 1 KiB by exact
+    size (16-byte classes), larger ones in 8 bins per power of two.  A bitmap
+    of non-empty bins makes a search a few bit operations: no list walk. */
+    static constexpr std::size_t kSmallLimit = 1024;
+    static constexpr std::size_t kSmallBins = kSmallLimit / 16;
+    static constexpr unsigned kSubBinBits = 3;
+    static constexpr std::size_t kBinCount = kSmallBins + (32 - 10) * (1u << kSubBinBits);
 
     HeapArena(MemoryResource& parent, std::size_t bytes,
               std::string_view name = "heap", int numa_node = -1);
@@ -151,6 +157,8 @@ private:
         return (value + alignment - 1) & ~(alignment - 1);
     }
     [[nodiscard]] static std::uint32_t bin_for(std::size_t bytes) noexcept;
+    // The first bin whose every block holds `bytes`.
+    [[nodiscard]] static std::uint32_t search_bin(std::size_t bytes) noexcept;
     [[nodiscard]] Block* block_of(void* ptr) const noexcept;
     [[nodiscard]] void* user_of(Block* block) const noexcept;
     void insert_free(Block* block) noexcept;
@@ -167,7 +175,21 @@ private:
     std::size_t m_allocations = 0;
     std::size_t m_frees = 0;
     std::size_t m_failures = 0;
-    Block* m_bins[kBinCount] = {};
+    /* Bin heads as 32-bit block indices (offset / 16 + 1; 0: empty), half
+    the size of pointers: heaps are embedded in small objects. */
+    [[nodiscard]] Block* head(std::size_t bin) const noexcept {
+        const std::uint32_t index = m_bins[bin];
+        return index == 0 ? nullptr
+                          : reinterpret_cast<Block*>(m_base + (std::size_t{index - 1} << 4));
+    }
+    void set_head(std::size_t bin, Block* block) noexcept {
+        m_bins[bin] = block == nullptr
+                          ? 0
+                          : static_cast<std::uint32_t>(
+                                ((reinterpret_cast<std::byte*>(block) - m_base) >> 4) + 1);
+    }
+    std::uint32_t m_bins[kBinCount] = {};
+    std::uint64_t m_bin_map[(kBinCount + 63) / 64] = {};
     std::string_view m_name;
     int m_numa_node = -1;
     bool m_numa_bound = false;

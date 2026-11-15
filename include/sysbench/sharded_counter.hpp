@@ -38,6 +38,13 @@ public:
         shard(thread_id).m_value.fetch_add(delta, std::memory_order_relaxed);
     }
 
+    // The shard's only writer is the calling thread: a plain load and store,
+    // no locked read-modify-write.  Readers still see whole values.
+    void add_local(std::uint32_t thread_id, T delta = T{1}) noexcept {
+        auto& value = shard(thread_id).m_value;
+        value.store(value.load(std::memory_order_relaxed) + delta, std::memory_order_relaxed);
+    }
+
     [[nodiscard]] T get(std::uint32_t thread_id) const noexcept {
         return shard(thread_id).m_value.load(std::memory_order_relaxed);
     }

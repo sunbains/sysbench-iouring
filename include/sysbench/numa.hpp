@@ -24,6 +24,8 @@
 #include <cstdint>
 #include <array>
 
+#include <sched.h>
+
 namespace sb::numa {
 
 inline constexpr std::uint32_t kMaxNodes = 64;
@@ -46,6 +48,10 @@ public:
     [[nodiscard]] const NodeInfo* node_by_id(int id) const noexcept;
     [[nodiscard]] int home_node() const noexcept { return m_home_node; }
     [[nodiscard]] int reserved_cpu() const noexcept { return m_reserved_cpu; }
+    /* The CPUs the process was allowed at startup, before the main thread
+    pinned itself to the reserved CPU (threads inherit their creator's mask,
+    so an unpinned worker must restore this one). */
+    [[nodiscard]] const cpu_set_t& process_cpus() const noexcept { return m_process_cpus; }
     [[nodiscard]] int node_of_cpu(unsigned cpu) const noexcept;
 
     // Worker assignment is balanced round-robin across online nodes.  CPUS are
@@ -62,6 +68,7 @@ private:
     std::uint32_t m_node_count = 0;
     int m_home_node = 0;
     int m_reserved_cpu = -1;
+    cpu_set_t m_process_cpus{};
     bool m_available = false;
 };
 

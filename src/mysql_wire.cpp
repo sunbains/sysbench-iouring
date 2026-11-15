@@ -24,6 +24,7 @@
 #include <array>
 #include <bit>
 #include <cstdio>
+#include <charconv>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -93,6 +94,15 @@ db::Field formatted_field(mem::MemoryResource& resource, const char* format,
     return text_field(resource, std::string_view(temporary, length));
 }
 
+// An integer column's text (binary protocol): to_chars, not snprintf.
+template <class Integer>
+db::Field integer_field(mem::MemoryResource& resource, Integer value) {
+    char temporary[24];
+    const auto end = std::to_chars(temporary, temporary + sizeof(temporary), value).ptr;
+    return text_field(resource,
+                      std::string_view(temporary, static_cast<std::size_t>(end - temporary)));
+}
+
 std::uint64_t read_uint_le(std::span<const std::byte> data) {
     std::uint64_t value = 0;
     for (std::size_t i = 0; i < data.size(); ++i) {
@@ -102,12 +112,12 @@ std::uint64_t read_uint_le(std::span<const std::byte> data) {
     return value;
 }
 
-bool binary_date(Reader& reader, db::Row& row, mem::MemoryResource& resource,
+bool binary_date(Reader& reader, mem::Vector<db::Field>& fields, mem::MemoryResource& resource,
                  bool time_only) {
     std::uint8_t length = 0;
     if (!reader.u8(length)) return false;
     if (length == 0) {
-        row.m_fields.push_back(text_field(resource,
+        fields.push_back(text_field(resource,
                                         time_only ? "00:00:00" : "0000-00-00 00:00:00"));
         return true;
     }
@@ -127,7 +137,7 @@ bool binary_date(Reader& reader, db::Row& row, mem::MemoryResource& resource,
             }
             const std::uint64_t total_hours =
                 static_cast<std::uint64_t>(days) * 24u + hour;
-            row.m_fields.push_back(formatted_field(
+            fields.push_back(formatted_field(
                 resource, "%s%02llu:%02u:%02u", negative != 0 ? "-" : "",
                 static_cast<unsigned long long>(total_hours),
                 static_cast<unsigned>(minute), static_cast<unsigned>(second)));
@@ -136,7 +146,7 @@ bool binary_date(Reader& reader, db::Row& row, mem::MemoryResource& resource,
                 if (!reader.u32(micros)) return false;
             }
         } else {
-            row.m_fields.push_back(text_field(resource, "00:00:00"));
+            fields.push_back(text_field(resource, "00:00:00"));
         }
         return true;
     }
@@ -149,11 +159,11 @@ bool binary_date(Reader& reader, db::Row& row, mem::MemoryResource& resource,
         if (!reader.u8(hour) || !reader.u8(minute) || !reader.u8(second)) return false;
     }
     if (has_time) {
-        row.m_fields.push_back(formatted_field(
+        fields.push_back(formatted_field(
             resource, "%04u-%02u-%02u %02u:%02u:%02u", year, month, day, hour,
             minute, second));
     } else {
-        row.m_fields.push_back(
+        fields.push_back(
             formatted_field(resource, "%04u-%02u-%02u", year, month, day));
     }
     if (length == 11) {
@@ -708,18 +718,16 @@ Bytes build_handshake_response(const Handshake& handshake,
 // ---------------------------------------------------------------------------
 
 bool parse_text_row(std::span<const std::byte> payload, std::size_t column_count,
-                    mem::MemoryResource& resource, db::Row& row) {
+                    mem::MemoryResource& resource, mem::Vector<db::Field>& fields) {
     (void)resource;
-    row.m_fields.clear();
-    row.m_fields.reserve(column_count);
     Reader reader(payload);
     for (std::size_t i = 0; i < column_count; ++i) {
         std::string_view value;
         const auto result = reader.lenenc_string(value);
         if (result == Reader::StringResult::Null) {
-            row.m_fields.push_back(db::Field{});
+            fields.push_back(db::Field{});
         } else if (result == Reader::StringResult::Ok) {
-            row.m_fields.push_back(db::Field{value.data(),
+            fields.push_back(db::Field{value.data(),
                                            static_cast<std::uint32_t>(value.size()),
                                            false});
         } else {
@@ -731,7 +739,7 @@ bool parse_text_row(std::span<const std::byte> payload, std::size_t column_count
 
 bool parse_binary_row(std::span<const std::byte> payload,
                       std::span<const db::Column> columns,
-                      mem::MemoryResource& resource, db::Row& row) {
+                      mem::MemoryResource& resource, mem::Vector<db::Field>& fields) {
     if (payload.empty() || std::to_integer<std::uint8_t>(payload[0]) != 0x00) {
         return false;
     }
@@ -743,8 +751,6 @@ bool parse_binary_row(std::span<const std::byte> payload,
     std::span<const std::byte> bitmap;
     if (!reader.take(bitmap_length, bitmap)) return false;
 
-    row.m_fields.clear();
-    row.m_fields.reserve(columns.size());
 
     auto is_null = [&](std::size_t index) {
         const std::size_t bit = index + 2;
@@ -755,7 +761,7 @@ bool parse_binary_row(std::span<const std::byte> payload,
     for (std::size_t i = 0; i < columns.size(); ++i) {
         const db::Column& column = columns[i];
         if (is_null(i) || column.m_type == TYPE_NULL) {
-            row.m_fields.push_back(db::Field{});
+            fields.push_back(db::Field{});
             continue;
         }
         const bool is_unsigned = (column.m_flags & UNSIGNED_FLAG) != 0;
@@ -763,9 +769,9 @@ bool parse_binary_row(std::span<const std::byte> payload,
             case TYPE_TINY: {
                 std::uint8_t raw = 0;
                 if (!reader.u8(raw)) return false;
-                if (is_unsigned) row.m_fields.push_back(formatted_field(resource, "%u", raw));
-                else row.m_fields.push_back(
-                    formatted_field(resource, "%d", static_cast<int>(static_cast<std::int8_t>(raw))));
+                if (is_unsigned) fields.push_back(integer_field(resource, static_cast<unsigned>(raw)));
+                else fields.push_back(
+                    integer_field(resource, static_cast<int>(static_cast<std::int8_t>(raw))));
                 break;
             }
             case TYPE_SHORT:
@@ -773,38 +779,36 @@ bool parse_binary_row(std::span<const std::byte> payload,
                 std::uint16_t raw = 0;
                 if (!reader.u16(raw)) return false;
                 if (is_unsigned || column.m_type == TYPE_YEAR)
-                    row.m_fields.push_back(formatted_field(resource, "%u", raw));
+                    fields.push_back(integer_field(resource, static_cast<unsigned>(raw)));
                 else
-                    row.m_fields.push_back(
-                        formatted_field(resource, "%d", static_cast<std::int16_t>(raw)));
+                    fields.push_back(
+                        integer_field(resource, static_cast<int>(static_cast<std::int16_t>(raw))));
                 break;
             }
             case TYPE_LONG:
             case TYPE_INT24: {
                 std::uint32_t raw = 0;
                 if (!reader.u32(raw)) return false;
-                if (is_unsigned) row.m_fields.push_back(formatted_field(resource, "%u", raw));
+                if (is_unsigned) fields.push_back(integer_field(resource, static_cast<unsigned>(raw)));
                 else
-                    row.m_fields.push_back(
-                        formatted_field(resource, "%d", static_cast<std::int32_t>(raw)));
+                    fields.push_back(
+                        integer_field(resource, static_cast<std::int32_t>(raw)));
                 break;
             }
             case TYPE_LONGLONG: {
                 std::uint64_t raw = 0;
                 if (!reader.u64(raw)) return false;
                 if (is_unsigned)
-                    row.m_fields.push_back(formatted_field(resource, "%llu",
-                                                         static_cast<unsigned long long>(raw)));
+                    fields.push_back(integer_field(resource, raw));
                 else
-                    row.m_fields.push_back(formatted_field(resource, "%lld",
-                                                         static_cast<long long>(raw)));
+                    fields.push_back(integer_field(resource, static_cast<std::int64_t>(raw)));
                 break;
             }
             case TYPE_FLOAT: {
                 std::uint32_t raw = 0;
                 if (!reader.u32(raw)) return false;
                 const float value = std::bit_cast<float>(raw);
-                row.m_fields.push_back(formatted_field(resource, "%.9g",
+                fields.push_back(formatted_field(resource, "%.9g",
                                                      static_cast<double>(value)));
                 break;
             }
@@ -812,7 +816,7 @@ bool parse_binary_row(std::span<const std::byte> payload,
                 std::uint64_t raw = 0;
                 if (!reader.u64(raw)) return false;
                 const double value = std::bit_cast<double>(raw);
-                row.m_fields.push_back(formatted_field(resource, "%.17g", value));
+                fields.push_back(formatted_field(resource, "%.17g", value));
                 break;
             }
             case TYPE_DATE:
@@ -821,11 +825,11 @@ bool parse_binary_row(std::span<const std::byte> payload,
             case TYPE_TIMESTAMP:
             case TYPE_DATETIME2:
             case TYPE_TIMESTAMP2:
-                if (!binary_date(reader, row, resource, false)) return false;
+                if (!binary_date(reader, fields, resource, false)) return false;
                 break;
             case TYPE_TIME:
             case TYPE_TIME2:
-                if (!binary_date(reader, row, resource, true)) return false;
+                if (!binary_date(reader, fields, resource, true)) return false;
                 break;
             case TYPE_DECIMAL:
             case TYPE_NEWDECIMAL:
@@ -845,7 +849,7 @@ bool parse_binary_row(std::span<const std::byte> payload,
                 if (reader.lenenc_string(value) != Reader::StringResult::Ok) {
                     return false;
                 }
-                row.m_fields.push_back(db::Field{value.data(),
+                fields.push_back(db::Field{value.data(),
                                                static_cast<std::uint32_t>(value.size()),
                                                false});
                 break;
@@ -858,7 +862,7 @@ bool parse_binary_row(std::span<const std::byte> payload,
 }
 
 void build_stmt_execute_payload(Bytes& out, std::uint32_t statement_id,
-                                std::span<const db::BindValue> parameters) {
+                                std::span<const db::BindValue> parameters, bool send_types) {
     Writer writer(out);
     writer.u8(0x17);
     writer.u32(statement_id);
@@ -875,9 +879,10 @@ void build_stmt_execute_payload(Bytes& out, std::uint32_t statement_id,
             out[bitmap_start + i / 8] |= static_cast<std::byte>(1u << (i % 8));
         }
     }
-    writer.u8(1);  // new params bound
+    writer.u8(send_types ? 1 : 0);  // new params bound
 
     for (const auto& parameter : parameters) {
+        if (!send_types) break;
         switch (parameter.m_kind) {
             case db::BindKind::Null:
                 writer.u8(TYPE_NULL);

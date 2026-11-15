@@ -48,12 +48,20 @@ set_tests_properties(mysql_wire_perf PROPERTIES LABELS "perf;mysql")
 
 add_executable(test_mysql_connection test_mysql_connection.cpp)
 target_link_libraries(test_mysql_connection PRIVATE sysbench_core)
+if(SYSBENCH_MYSQL_V2)
+    target_compile_definitions(test_mysql_connection PRIVATE
+        SYSBENCH_MYSQL_CLIENT_LIB_DIR="${SYSBENCH_MYSQL_CLIENT_LIB_DIR}")
+endif()
 target_compile_options(test_mysql_connection PRIVATE -Wall -Wextra -Wpedantic)
 add_test(NAME mysql_connection COMMAND test_mysql_connection)
 set_tests_properties(mysql_connection PROPERTIES LABELS "unit;mysql" TIMEOUT 60)
 
 add_executable(test_mysql_connection_perf test_mysql_connection.cpp)
 target_link_libraries(test_mysql_connection_perf PRIVATE sysbench_core)
+if(SYSBENCH_MYSQL_V2)
+    target_compile_definitions(test_mysql_connection_perf PRIVATE
+        SYSBENCH_MYSQL_CLIENT_LIB_DIR="${SYSBENCH_MYSQL_CLIENT_LIB_DIR}")
+endif()
 target_compile_options(test_mysql_connection_perf PRIVATE -Wall -Wextra -Wpedantic)
 add_test(NAME mysql_connection_perf COMMAND test_mysql_connection_perf throughput)
 set_tests_properties(mysql_connection_perf PROPERTIES LABELS "perf;mysql" TIMEOUT 60)

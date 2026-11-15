@@ -1,0 +1,73 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 720" font-family="Inter, 'Segoe UI', Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#334155"/>
+    </marker>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#f8fafc"/><stop offset="1" stop-color="#eef2f7"/>
+    </linearGradient>
+  </defs>
+  <rect width="1280" height="720" fill="url(#bg)"/>
+  <rect width="1280" height="92" fill="#0f172a"/>
+  <text x="56" y="58" fill="#f8fafc" font-size="34" font-weight="700">A query, default architecture</text>
+  <text x="1224" y="58" fill="#94a3b8" font-size="18" text-anchor="end">blocking send / recv · 2 of 5</text>
+
+  <!-- lane headers -->
+  <g font-size="19" font-weight="700" text-anchor="middle" fill="#fff">
+    <rect x="56" y="116" width="220" height="44" rx="10" fill="#7c3aed"/><text x="166" y="145">Lua script</text>
+    <rect x="296" y="116" width="220" height="44" rx="10" fill="#2563eb"/><text x="406" y="145">Lua binding (C++)</text>
+    <rect x="536" y="116" width="220" height="44" rx="10" fill="#0891b2"/><text x="646" y="145">MySQL driver</text>
+    <rect x="776" y="116" width="220" height="44" rx="10" fill="#475569"/><text x="886" y="145">Kernel / NIC</text>
+    <rect x="1016" y="116" width="208" height="44" rx="10" fill="#ea580c"/><text x="1120" y="145">MySQL server</text>
+  </g>
+  <g stroke="#cbd5e1" stroke-width="2" stroke-dasharray="6 6">
+    <line x1="166" y1="160" x2="166" y2="610"/><line x1="406" y1="160" x2="406" y2="610"/>
+    <line x1="646" y1="160" x2="646" y2="610"/><line x1="886" y1="160" x2="886" y2="610"/>
+    <line x1="1120" y1="160" x2="1120" y2="610"/>
+  </g>
+
+  <g font-size="16" fill="#0f172a">
+    <!-- 1 -->
+    <rect x="72" y="180" width="188" height="40" rx="9" fill="#ede9fe" stroke="#7c3aed"/>
+    <text x="166" y="206" text-anchor="middle">event(): con:query(sql)</text>
+    <path d="M260,200 L392,200" stroke="#334155" stroke-width="2.5" marker-end="url(#a)"/>
+    <!-- 2 -->
+    <rect x="312" y="180" width="188" height="58" rx="9" fill="#dbeafe" stroke="#2563eb"/>
+    <text x="406" y="204" text-anchor="middle">l_sql_query</text>
+    <text x="406" y="226" text-anchor="middle" font-size="14" fill="#334155">stats, cached kind</text>
+    <path d="M500,226 L632,252" stroke="#334155" stroke-width="2.5" marker-end="url(#a)"/>
+    <!-- 3 -->
+    <rect x="552" y="242" width="188" height="58" rx="9" fill="#cffafe" stroke="#0891b2"/>
+    <text x="646" y="266" text-anchor="middle">query_sync</text>
+    <text x="646" y="288" text-anchor="middle" font-size="14" fill="#334155">frame COM_QUERY</text>
+    <path d="M740,282 L872,302" stroke="#334155" stroke-width="2.5" marker-end="url(#a)"/>
+    <!-- 4 send -->
+    <rect x="792" y="294" width="188" height="40" rx="9" fill="#e2e8f0" stroke="#475569"/>
+    <text x="886" y="320" text-anchor="middle">send()</text>
+    <path d="M980,314 L1106,334" stroke="#334155" stroke-width="2.5" marker-end="url(#a)"/>
+    <!-- 5 server -->
+    <rect x="1030" y="328" width="180" height="58" rx="9" fill="#ffedd5" stroke="#ea580c"/>
+    <text x="1120" y="352" text-anchor="middle">execute</text>
+    <text x="1120" y="374" text-anchor="middle" font-size="14" fill="#334155">reply packets</text>
+    <!-- 6 recv -->
+    <rect x="792" y="404" width="188" height="58" rx="9" fill="#e2e8f0" stroke="#475569"/>
+    <text x="886" y="428" text-anchor="middle">recv() blocks</text>
+    <text x="886" y="450" text-anchor="middle" font-size="14" fill="#334155">busy-polls the NIC</text>
+    <path d="M1106,380 L980,420" stroke="#334155" stroke-width="2.5" marker-end="url(#a)"/>
+    <path d="M792,446 L740,470" stroke="#334155" stroke-width="2.5" marker-end="url(#a)"/>
+    <!-- 7 parse -->
+    <rect x="552" y="460" width="188" height="58" rx="9" fill="#cffafe" stroke="#0891b2"/>
+    <text x="646" y="484" text-anchor="middle">ResultParser</text>
+    <text x="646" y="506" text-anchor="middle" font-size="14" fill="#334155">views · only rows copied</text>
+    <path d="M552,500 L500,526" stroke="#334155" stroke-width="2.5" marker-end="url(#a)"/>
+    <!-- 8 push -->
+    <rect x="312" y="514" width="188" height="40" rx="9" fill="#dbeafe" stroke="#2563eb"/>
+    <text x="406" y="540" text-anchor="middle">push_result (reused)</text>
+    <path d="M312,546 L260,566" stroke="#334155" stroke-width="2.5" marker-end="url(#a)"/>
+    <rect x="72" y="560" width="188" height="40" rx="9" fill="#ede9fe" stroke="#7c3aed"/>
+    <text x="166" y="586" text-anchor="middle">rs returned</text>
+  </g>
+
+  <rect x="56" y="628" width="1168" height="64" rx="14" fill="#0f172a"/>
+  <text x="84" y="668" fill="#f8fafc" font-size="19"><tspan font-weight="700">No yield, no coroutine frame:</tspan><tspan fill="#cbd5e1"> the call completes inside the C function, like libmysqlclient — one send, one recv.</tspan></text>
+</svg>

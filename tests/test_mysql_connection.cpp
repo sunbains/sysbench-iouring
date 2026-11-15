@@ -20,6 +20,8 @@
 #include "sysbench/db.hpp"
 #include "sysbench/memory.hpp"
 #include "sysbench/mysql.hpp"
+#include "sysbench/lua.hpp"
+#include "sysbench/options.hpp"
 #include "sysbench/runtime.hpp"
 #include "sysbench/socket_io.hpp"
 #include "sysbench/task.hpp"
@@ -29,6 +31,7 @@
 #include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <openssl/ssl.h>
 
 #include <atomic>
 #include <cerrno>
@@ -43,14 +46,18 @@ using namespace sb;
 
 namespace {
 
-enum class MockAuth { Native, CachingSha2Fast };
+enum class MockAuth { Native, CachingSha2Fast, CachingSha2Full };
 
 // Scripted MySQL server.  It is a plain Runtime coroutine: every socket
 // operation is an io_uring awaiter, so the fixture owns no threads and never
 // blocks a worker.
 class MockMysqlServer {
 public:
-    explicit MockMysqlServer(MockAuth auth = MockAuth::Native) : m_auth(auth) {
+    explicit MockMysqlServer(MockAuth auth = MockAuth::Native, bool v2 = false,
+                             bool deprecate_eof = true, unsigned sessions = 1,
+                             bool tls = false, bool mutual_tls = false)
+        : m_auth(auth), m_v2(v2), m_deprecate_eof(v2 && deprecate_eof),
+          m_sessions(sessions), m_tls(tls), m_mutual_tls(mutual_tls) {
         m_listen_fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
         if (m_listen_fd < 0) return;
         int one = 1;
@@ -72,15 +79,27 @@ public:
     }
 
     ~MockMysqlServer() {
+        close_tls();
         if (m_fd >= 0) ::close(m_fd);
         if (m_listen_fd >= 0) ::close(m_listen_fd);
     }
 
     [[nodiscard]] std::uint16_t port() const { return m_port; }
     [[nodiscard]] bool started() const { return m_listen_fd >= 0; }
+    [[nodiscard]] unsigned v2_sessions() const { return m_v2_sessions; }
+    [[nodiscard]] unsigned tls_sessions() const { return m_tls_sessions; }
 
     Task<void> run() {
-        SocketIo io(*Runtime::current(), Runtime::current_worker_id(), 64, 4, 4096);
+        for (unsigned i = 0; i < m_sessions; ++i) {
+            co_await run_session();
+            close_tls();
+            if (m_fd >= 0) ::close(m_fd);
+            m_fd = -1;
+        }
+    }
+
+    Task<void> run_session() {
+        SocketIo io(*Runtime::current(), Runtime::current_worker_id(), 4, 4096);
         m_io = &io;
 
         sockaddr_in peer{};
@@ -96,7 +115,25 @@ public:
 
         std::vector<std::uint8_t> payload;
         if (!co_await read_packet(payload)) co_return;
-        if (m_auth == MockAuth::CachingSha2Fast) {
+        if (payload.size() == 32 && m_tls) {
+            if (!co_await accept_tls()) co_return;
+            ++m_tls_sessions;
+            if (!co_await read_packet(payload)) co_return;
+        }
+        if (m_v2) {
+            const std::string_view response(reinterpret_cast<const char*>(payload.data()), payload.size());
+            const std::string_view attribute("\x10sqlrust_protocol\x01" "2", 19);
+            CHECK(response.find(attribute) != std::string_view::npos);
+            if (response.find(attribute) != std::string_view::npos) ++m_v2_sessions;
+        }
+        if (m_auth == MockAuth::CachingSha2Full) {
+            if (!co_await send_packet({1, 4}, 3)) co_return;
+            if (!co_await read_packet(payload)) co_return;
+            CHECK(m_ssl != nullptr);
+            CHECK_EQ(std::string_view(reinterpret_cast<const char*>(payload.data()), payload.size()),
+                     std::string_view("password\0", 9));
+            if (!co_await send_packet(ok_packet(), 5)) co_return;
+        } else if (m_auth == MockAuth::CachingSha2Fast) {
             const std::vector<std::uint8_t> more{0x01, 0x03};
             if (!co_await send_packet(more, 2)) co_return;
             if (!co_await send_packet(ok_packet(), 3)) co_return;
@@ -111,7 +148,7 @@ public:
                     if (!co_await handle_query(payload)) co_return;
                     break;
                 case 0x16:
-                    if (!co_await handle_prepare()) co_return;
+                    if (!co_await handle_prepare(payload)) co_return;
                     break;
                 case 0x17:
                     if (!co_await handle_execute()) co_return;
@@ -136,7 +173,104 @@ public:
     }
 
 private:
+    void close_tls() {
+        SSL_free(std::exchange(m_ssl, nullptr));
+        SSL_CTX_free(std::exchange(m_ssl_ctx, nullptr));
+        m_rbio = nullptr;
+        m_wbio = nullptr;
+    }
+    Task<bool> tls_flush() {
+        std::uint8_t buffer[4096];
+        while (BIO_ctrl_pending(m_wbio) > 0) {
+            const int size = BIO_read(m_wbio, buffer, sizeof(buffer));
+            if (size <= 0 || !co_await raw_send_all(buffer, static_cast<std::size_t>(size))) co_return false;
+        }
+        co_return true;
+    }
+    Task<bool> tls_feed() {
+        std::uint8_t buffer[4096];
+        const int size = co_await ring_recv(*m_io, m_fd, buffer, sizeof(buffer), 0);
+        co_return size > 0 && BIO_write(m_rbio, buffer, size) == size;
+    }
+    Task<bool> accept_tls() {
+#ifdef SYSBENCH_HAVE_MYSQL_V2
+        m_ssl_ctx = SSL_CTX_new(TLS_server_method());
+        if (m_ssl_ctx == nullptr) co_return false;
+        SSL_CTX_set_min_proto_version(m_ssl_ctx, TLS1_2_VERSION);
+        if (SSL_CTX_use_certificate_chain_file(m_ssl_ctx,
+                SYSBENCH_MYSQL_CLIENT_LIB_DIR "/tests/fixtures/server.pem") != 1 ||
+            SSL_CTX_use_PrivateKey_file(m_ssl_ctx,
+                SYSBENCH_MYSQL_CLIENT_LIB_DIR "/tests/fixtures/server-key.pem", SSL_FILETYPE_PEM) != 1) {
+            co_return false;
+        }
+        if (m_mutual_tls) {
+            if (SSL_CTX_load_verify_locations(m_ssl_ctx,
+                SYSBENCH_MYSQL_CLIENT_LIB_DIR "/tests/fixtures/ca.pem", nullptr) != 1) co_return false;
+            SSL_CTX_set_verify(m_ssl_ctx, SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT, nullptr);
+        }
+        m_ssl = SSL_new(m_ssl_ctx);
+        if (m_ssl == nullptr) co_return false;
+        m_rbio = BIO_new(BIO_s_mem());
+        m_wbio = BIO_new(BIO_s_mem());
+        SSL_set_bio(m_ssl, m_rbio, m_wbio);
+        SSL_set_accept_state(m_ssl);
+        for (;;) {
+            const int result = SSL_do_handshake(m_ssl);
+            const int error = result == 1 ? SSL_ERROR_NONE : SSL_get_error(m_ssl, result);
+            if (!co_await tls_flush()) co_return false;
+            if (result == 1) co_return true;
+            if (error == SSL_ERROR_WANT_READ) {
+                if (!co_await tls_feed()) co_return false;
+            } else if (error != SSL_ERROR_WANT_WRITE) {
+                co_return false;
+            }
+        }
+#else
+        co_return false;
+#endif
+    }
     Task<bool> recv_all(void* data, std::size_t size) {
+        if (m_ssl == nullptr) co_return co_await raw_recv_all(data, size);
+        auto* bytes = static_cast<std::uint8_t*>(data);
+        while (size != 0) {
+            const int got = SSL_read(m_ssl, bytes, static_cast<int>(size));
+            if (got > 0) {
+                bytes += got;
+                size -= static_cast<std::size_t>(got);
+            } else {
+                const int error = SSL_get_error(m_ssl, got);
+                if (!co_await tls_flush()) co_return false;
+                if (error == SSL_ERROR_WANT_READ) {
+                    if (!co_await tls_feed()) co_return false;
+                } else if (error != SSL_ERROR_WANT_WRITE) {
+                    co_return false;
+                }
+            }
+        }
+        co_return true;
+    }
+    Task<bool> send_all(const void* data, std::size_t size) {
+        if (m_ssl == nullptr) co_return co_await raw_send_all(data, size);
+        const auto* bytes = static_cast<const std::uint8_t*>(data);
+        while (size != 0) {
+            const int sent = SSL_write(m_ssl, bytes, static_cast<int>(size));
+            if (sent > 0) {
+                bytes += sent;
+                size -= static_cast<std::size_t>(sent);
+                if (!co_await tls_flush()) co_return false;
+            } else {
+                const int error = SSL_get_error(m_ssl, sent);
+                if (!co_await tls_flush()) co_return false;
+                if (error == SSL_ERROR_WANT_READ) {
+                    if (!co_await tls_feed()) co_return false;
+                } else if (error != SSL_ERROR_WANT_WRITE) {
+                    co_return false;
+                }
+            }
+        }
+        co_return true;
+    }
+    Task<bool> raw_recv_all(void* data, std::size_t size) {
         auto* bytes = static_cast<std::uint8_t*>(data);
         while (size > 0) {
             const int got = co_await ring_recv(*m_io, m_fd, bytes,
@@ -148,7 +282,7 @@ private:
         co_return true;
     }
 
-    Task<bool> send_all(const void* data, std::size_t size) {
+    Task<bool> raw_send_all(const void* data, std::size_t size) {
         const auto* bytes = static_cast<const std::uint8_t*>(data);
         while (size > 0) {
             const int sent = co_await ring_send(*m_io, m_fd, bytes,
@@ -279,6 +413,30 @@ private:
     Task<bool> handle_query(const std::vector<std::uint8_t>& payload) {
         const std::string_view sql(
             reinterpret_cast<const char*>(payload.data() + 1), payload.size() - 1);
+        if (m_v2 && sql.find("RETURNING") != std::string_view::npos) {
+            auto final_ok = ok_packet(2);
+            final_ok[2] = 41; // last_insert_id
+            final_ok[5] = 3;  // warnings
+            std::vector<std::vector<std::uint8_t>> response{
+                {3}, column_packet("c", 253), column_packet("id", 8),
+                column_packet("nullable", 253)};
+            if (!m_deprecate_eof) response.push_back(eof_packet());
+            response.push_back({0, 2, '4', '1', 0xfb}); // empty string and NULL
+            response.push_back({2, '4', '1', 2, '4', '2', 1, 'x'});
+            if (m_deprecate_eof) {
+                final_ok[0] = 0xfe;
+            } else {
+                auto more = eof_packet();
+                more[3] = 0x0a; // SERVER_MORE_RESULTS_EXISTS
+                response.push_back(more);
+            }
+            response.push_back(final_ok);
+            co_return co_await send_response(response);
+        }
+        if (m_v2 && sql == "FAIL") {
+            co_return co_await send_packet({0xff, 0xbd, 0x04, '#', '4', '0', '0', '0', '1',
+                                           'd', 'e', 'a', 'd', 'l', 'o', 'c', 'k'}, 1);
+        }
         if (sql.find("INSERT") != std::string_view::npos ||
             sql.find("CREATE") != std::string_view::npos ||
             sql.find("UPDATE") != std::string_view::npos ||
@@ -295,12 +453,34 @@ private:
                                     m_select_response.size());
     }
 
-    Task<bool> handle_prepare() {
+    Task<bool> handle_prepare(const std::vector<std::uint8_t>& payload) {
+        const std::string_view sql(reinterpret_cast<const char*>(payload.data() + 1), payload.size() - 1);
+        m_returning_prepared = m_v2 && sql.find("RETURNING") != std::string_view::npos;
+        if (m_v2 && sql == "BEGIN") {
+            co_return co_await send_packet({0xff, 0x0f, 0x05, '#', 'H', 'Y', '0', '0', '0',
+                                           'u', 'n', 's', 'u', 'p', 'p', 'o', 'r', 't', 'e', 'd'}, 1);
+        }
         co_return co_await send_all(m_prepare_response.data(),
                                     m_prepare_response.size());
     }
 
     Task<bool> handle_execute() {
+        if (m_returning_prepared) {
+            std::vector<std::vector<std::uint8_t>> response{{1}, column_packet("id", 8)};
+            if (!m_deprecate_eof) response.push_back(eof_packet());
+            response.push_back({0, 0, 42, 0, 0, 0, 0, 0, 0, 0});
+            auto final_ok = ok_packet(1);
+            final_ok[2] = 42;
+            if (m_deprecate_eof) {
+                final_ok[0] = 0xfe;
+            } else {
+                auto more = eof_packet();
+                more[3] = 0x0a;
+                response.push_back(more);
+            }
+            response.push_back(final_ok);
+            co_return co_await send_response(response);
+        }
         co_return co_await send_all(m_execute_response.data(),
                                     m_execute_response.size());
     }
@@ -317,7 +497,10 @@ private:
         payload.insert(payload.end(), auth1, auth1 + 8);
         payload.push_back(0);
         const std::uint32_t capabilities =
-            0x00000200 | 0x00008000 | 0x00080000 | 0x00200000 | 0x00020000;
+            0x00000200 | 0x00008000 | 0x00080000 | 0x00200000 | 0x00020000 |
+            (m_v2 ? 0x00100000 | 0x00040000 : 0) |
+            (m_tls ? 0x00000800 : 0) |
+            (m_deprecate_eof ? 0x01000000 : 0);
         put_u16(payload, static_cast<std::uint16_t>(capabilities & 0xffff));
         payload.push_back(45);
         put_u16(payload, 2);
@@ -328,7 +511,7 @@ private:
             payload.push_back(static_cast<std::uint8_t>(character));
         }
         payload.push_back(0);
-        const std::string_view plugin = m_auth == MockAuth::CachingSha2Fast
+        const std::string_view plugin = m_auth != MockAuth::Native
                                             ? "caching_sha2_password"
                                             : "mysql_native_password";
         payload.insert(payload.end(), plugin.begin(), plugin.end());
@@ -346,8 +529,14 @@ private:
         std::vector<std::uint8_t> row;
         put_lenenc(row, 1);
         row.push_back(static_cast<std::uint8_t>('1'));
-        build(m_select_response, {count, column_packet("1", 253), eof_packet(),
-                                  row, eof_packet()});
+        auto terminator = eof_packet();
+        if (m_deprecate_eof) {
+            terminator = ok_packet();
+            terminator[0] = 0xfe;
+            build(m_select_response, {count, column_packet("1", 253), row, terminator});
+        } else {
+            build(m_select_response, {count, column_packet("1", 253), eof_packet(), row, terminator});
+        }
         build(m_ok_response, {ok_packet(1)});
         std::vector<std::uint8_t> prepare_ok{0x00};
         put_u32(prepare_ok, 1);
@@ -355,18 +544,37 @@ private:
         put_u16(prepare_ok, 1);
         prepare_ok.push_back(0);
         put_u16(prepare_ok, 0);
-        build(m_prepare_response, {prepare_ok, column_packet("id", 3), eof_packet(),
-                                   column_packet("v", 8), eof_packet()});
+        if (m_deprecate_eof) {
+            build(m_prepare_response, {prepare_ok, column_packet("id", 3), column_packet("v", 8)});
+        } else {
+            build(m_prepare_response, {prepare_ok, column_packet("id", 3), eof_packet(),
+                                       column_packet("v", 8), eof_packet()});
+        }
         std::vector<std::uint8_t> row8{0x00, 0x00};
         const std::uint64_t value = 42;
         for (int i = 0; i < 8; ++i) {
             row8.push_back(static_cast<std::uint8_t>(value >> (i * 8)));
         }
-        build(m_execute_response, {{1}, column_packet("v", 8), eof_packet(),
-                                   row8, eof_packet()});
+        if (m_deprecate_eof) {
+            terminator = ok_packet(1);
+            terminator[0] = 0xfe;
+            build(m_execute_response, {{1}, column_packet("v", 8), row8, terminator});
+        } else {
+            build(m_execute_response, {{1}, column_packet("v", 8), eof_packet(), row8, eof_packet()});
+        }
     }
 
     MockAuth m_auth;
+    bool m_v2, m_deprecate_eof;
+    unsigned m_sessions;
+    unsigned m_v2_sessions = 0;
+    bool m_tls, m_mutual_tls;
+    unsigned m_tls_sessions = 0;
+    SSL_CTX* m_ssl_ctx = nullptr;
+    SSL* m_ssl = nullptr;
+    BIO* m_rbio = nullptr;
+    BIO* m_wbio = nullptr;
+    bool m_returning_prepared = false;
     std::vector<std::uint8_t> m_select_response;
     std::vector<std::uint8_t> m_ok_response;
     std::vector<std::uint8_t> m_prepare_response;
@@ -378,7 +586,8 @@ private:
 };
 
 Task<void> client_flow(std::uint16_t port, std::atomic<int>& stages,
-                       std::atomic<bool>& ok) {
+                       std::atomic<bool>& ok, std::uint32_t protocol_version = 1,
+                       bool tls = false, bool client_certificate = false) {
     auto& allocator = Runtime::current_allocator();
     db::Driver* driver = db::DriverRegistry::instance().create("mysql", allocator);
     if (driver == nullptr) co_return;
@@ -389,6 +598,21 @@ Task<void> client_flow(std::uint16_t port, std::atomic<int>& stages,
     options.m_port = port_string;
     options.m_user = "bench";
     options.m_password = "password";
+    options.m_protocol_version = protocol_version;
+#ifdef SYSBENCH_HAVE_MYSQL_V2
+    if (tls) {
+        options.m_tls_mode = db::TlsMode::Required;
+        options.m_tls_verify_server_cert = true;
+        options.m_tls_ca = SYSBENCH_MYSQL_CLIENT_LIB_DIR "/tests/fixtures/ca.pem";
+        if (client_certificate) {
+            options.m_tls_cert = SYSBENCH_MYSQL_CLIENT_LIB_DIR "/tests/fixtures/client.pem";
+            options.m_tls_key = SYSBENCH_MYSQL_CLIENT_LIB_DIR "/tests/fixtures/client-key.pem";
+        }
+    }
+#else
+    (void)tls;
+    (void)client_certificate;
+#endif
 
     auto connect_result = co_await driver->connect(options, allocator);
     if (connect_result.is_err()) {
@@ -408,11 +632,11 @@ Task<void> client_flow(std::uint16_t port, std::atomic<int>& stages,
         } else {
             const db::ResultSet& rows = result.value();
             ok.store(rows.m_has_rows && rows.m_columns.size() == 1 &&
-                         rows.m_rows.size() == 1 &&
-                         rows.m_rows[0].m_fields.size() == 1 &&
-                         !rows.m_rows[0].m_fields[0].m_is_null &&
-                         std::string_view(rows.m_rows[0].m_fields[0].m_data,
-                                          rows.m_rows[0].m_fields[0].m_length) == "1",
+                         rows.row_count() == 1 &&
+                         rows.row(0).size() == 1 &&
+                         !rows.row(0)[0].m_is_null &&
+                         std::string_view(rows.row(0)[0].m_data,
+                                          rows.row(0)[0].m_length) == "1",
                      std::memory_order_relaxed);
         }
         stages.fetch_add(1);
@@ -444,10 +668,10 @@ Task<void> client_flow(std::uint16_t port, std::atomic<int>& stages,
                 ok.store(false, std::memory_order_relaxed);
             } else {
                 const db::ResultSet& rows = result.value();
-                ok.store(ok.load() && rows.m_has_rows && rows.m_rows.size() == 1 &&
-                             rows.m_rows[0].m_fields.size() == 1 &&
-                             std::string_view(rows.m_rows[0].m_fields[0].m_data,
-                                              rows.m_rows[0].m_fields[0].m_length) == "42",
+                ok.store(ok.load() && rows.m_has_rows && rows.row_count() == 1 &&
+                             rows.row(0).size() == 1 &&
+                             std::string_view(rows.row(0)[0].m_data,
+                                              rows.row(0)[0].m_length) == "42",
                          std::memory_order_relaxed);
             }
             stages.fetch_add(1);
@@ -501,6 +725,311 @@ TEST("MySQL caching_sha2 fast auth") {
     runtime.shutdown();
 }
 
+#ifdef SYSBENCH_HAVE_MYSQL_V2
+namespace {
+
+std::string_view field_text(const db::Field& field) {
+    return {field.m_data, field.m_length};
+}
+
+Task<void> returning_flow(std::uint16_t port, bool reconnect, std::atomic<bool>& complete,
+                          bool tls = false) {
+    auto& allocator = Runtime::current_allocator();
+    auto* driver = db::DriverRegistry::instance().create("mysql", allocator);
+    const auto port_string = std::to_string(port);
+    db::ConnectionOptions options;
+    options.m_port = port_string;
+    options.m_protocol_version = 2;
+    if (tls) {
+        options.m_tls_mode = db::TlsMode::Required;
+        options.m_tls_verify_server_cert = true;
+        options.m_tls_ca = SYSBENCH_MYSQL_CLIENT_LIB_DIR "/tests/fixtures/ca.pem";
+    }
+    auto connected = co_await driver->connect(options, allocator);
+    CHECK(connected.is_ok());
+    if (connected.is_err()) {
+        std::println(stderr, "v2 connect failed: {}", connected.error().message());
+        driver->destroy(allocator);
+        co_return;
+    }
+    auto* connection = connected.value();
+    CHECK_EQ(connection->driver_name(), "mysql");
+    mem::BumpArena arena(allocator, 128 * 1024);
+    {
+        auto query = co_await connection->query(
+            "INSERT INTO t(c) VALUES (''), ('41') RETURNING c, id, nullable", arena);
+        CHECK(query.is_ok());
+        if (query.is_ok()) {
+            const auto& result = query.value();
+            CHECK(result.m_has_rows);
+            CHECK(!result.m_more_results);
+            CHECK_EQ(result.m_columns.size(), 3u);
+            CHECK_EQ(result.row_count(), 2u);
+            CHECK_EQ(result.m_affected_rows, 2u);
+            CHECK_EQ(result.m_last_insert_id, 41u);
+            CHECK_EQ(result.m_warnings, 3);
+            CHECK_EQ(result.m_status, 2);
+            if (result.row_count() == 2 && result.m_columns.size() == 3) {
+                CHECK_EQ(result.m_columns[0].m_name, "c");
+                CHECK_EQ(field_text(result.row(0)[0]), "");
+                CHECK(!result.row(0)[0].m_is_null);
+                CHECK(result.row(0)[2].m_is_null);
+                CHECK_EQ(field_text(result.row(1)[0]), "41");
+                CHECK_EQ(field_text(result.row(1)[1]), "42");
+            }
+        } else {
+            std::println(stderr, "v2 RETURNING failed: {}", query.error().message());
+        }
+    }
+    // The next command must see its own response after all RETURNING results
+    // have been drained, including the trailing OK used by EOF-style servers.
+    {
+        auto query = co_await connection->query("SELECT 1", arena);
+        CHECK(query.is_ok());
+        if (query.is_ok()) CHECK_EQ(query.value().row_count(), 1u);
+    }
+    {
+        auto query = co_await connection->query("FAIL", arena);
+        CHECK(query.is_err());
+        if (query.is_err()) {
+            CHECK_EQ(query.error().code(), 1213);
+            CHECK_EQ(std::string_view(query.error().state()), "40001");
+            CHECK_EQ(std::string_view(query.error().message()), "deadlock");
+            CHECK(!query.error().fatal());
+        }
+        CHECK(connection->healthy());
+    }
+    auto prepared = co_await connection->prepare("INSERT INTO t(c) VALUES (?) RETURNING id");
+    CHECK(prepared.is_ok());
+    db::PreparedStatement* statement = prepared.is_ok() ? prepared.value() : nullptr;
+    if (statement != nullptr) {
+        const db::BindValue parameters[] = {db::BindValue::from_bytes("value")};
+        auto query = co_await statement->execute(parameters, arena);
+        CHECK(query.is_ok());
+        if (query.is_ok()) {
+            CHECK_EQ(query.value().row_count(), 1u);
+            CHECK_EQ(query.value().m_affected_rows, 1u);
+            CHECK_EQ(query.value().m_last_insert_id, 42u);
+            if (!query.value().row_count() == 0) {
+                CHECK_EQ(field_text(query.value().row(0)[0]), "42");
+            }
+        }
+    }
+    {
+        auto begin = co_await connection->prepare("BEGIN");
+        CHECK(begin.is_ok());
+        if (begin.is_ok()) {
+            auto query = co_await begin.value()->execute({}, arena);
+            CHECK(query.is_ok());
+            CHECK((co_await begin.value()->close()).is_ok());
+            begin.value()->destroy(allocator);
+        }
+    }
+    if (reconnect) {
+        CHECK((co_await connection->reconnect()).is_ok());
+        CHECK(connection->healthy());
+        if (statement != nullptr) {
+            auto stale = co_await statement->execute({}, arena);
+            CHECK(stale.is_err());
+            if (stale.is_err()) CHECK_EQ(stale.error().code(), 1243);
+        }
+        auto query = co_await connection->query("SELECT 1", arena);
+        CHECK(query.is_ok());
+    }
+    if (statement != nullptr) {
+        CHECK((co_await statement->close()).is_ok());
+        CHECK((co_await statement->close()).is_ok());
+        CHECK(statement->closed());
+        statement->destroy(allocator);
+    }
+    connection->close();
+    connection->destroy(allocator);
+    driver->destroy(allocator);
+    complete = true;
+}
+
+Task<void> rejected_v2_flow(std::uint16_t port, db::TlsMode tls, int expected_error,
+                            std::atomic<bool>& complete, bool verify_certificate = false) {
+    auto& allocator = Runtime::current_allocator();
+    auto* driver = db::DriverRegistry::instance().create("mysql", allocator);
+    const auto port_string = std::to_string(port);
+    db::ConnectionOptions options;
+    options.m_port = port_string;
+    options.m_protocol_version = 2;
+    options.m_tls_mode = tls;
+    options.m_tls_verify_server_cert = verify_certificate;
+    auto connected = co_await driver->connect(options, allocator);
+    CHECK(connected.is_err());
+    if (connected.is_err()) CHECK_EQ(connected.error().code(), expected_error);
+    if (connected.is_ok()) connected.value()->destroy(allocator);
+    driver->destroy(allocator);
+    complete = true;
+}
+
+}  // namespace
+
+TEST("MySQL v2 Rust client handshake, text and prepared protocols") {
+    mysql::register_driver();
+    for (const auto auth : {MockAuth::Native, MockAuth::CachingSha2Fast}) {
+        MockMysqlServer server(auth, true);
+        REQUIRE(server.started());
+        Runtime runtime;
+        runtime.start(Runtime::Config{.m_workers = 1, .m_worker_heap_bytes = 8 * 1024 * 1024});
+        std::atomic<int> stages{0};
+        std::atomic<bool> ok{true};
+        runtime.spawn(server.run());
+        runtime.spawn(client_flow(server.port(), stages, ok, 2));
+        runtime.wait();
+        CHECK_EQ(stages.load(), 5);
+        CHECK_EQ(server.v2_sessions(), 1u);
+        CHECK(ok.load());
+        runtime.shutdown();
+    }
+}
+
+TEST("MySQL v2 RETURNING rows, counts and result draining") {
+    mysql::register_driver();
+    for (bool deprecate_eof : {true, false}) {
+        MockMysqlServer server(MockAuth::Native, true, deprecate_eof);
+        REQUIRE(server.started());
+        Runtime runtime;
+        runtime.start(Runtime::Config{.m_workers = 1, .m_worker_heap_bytes = 8 * 1024 * 1024});
+        std::atomic<bool> complete{false};
+        runtime.spawn(server.run());
+        runtime.spawn(returning_flow(server.port(), false, complete));
+        runtime.wait();
+        CHECK(complete.load());
+        CHECK_EQ(server.v2_sessions(), 1u);
+        runtime.shutdown();
+    }
+}
+
+TEST("MySQL v2 interleaves sessions on one worker and renegotiates on reconnect") {
+    mysql::register_driver();
+    MockMysqlServer first(MockAuth::Native, true, true, 2);
+    MockMysqlServer second(MockAuth::CachingSha2Fast, true, true, 2);
+    REQUIRE(first.started() && second.started());
+    Runtime runtime;
+    runtime.start(Runtime::Config{.m_workers = 1, .m_worker_heap_bytes = 16 * 1024 * 1024});
+    std::atomic<bool> first_done{false}, second_done{false};
+    runtime.spawn(first.run());
+    runtime.spawn(second.run());
+    runtime.spawn(returning_flow(first.port(), true, first_done));
+    runtime.spawn(returning_flow(second.port(), true, second_done));
+    runtime.wait();
+    CHECK(first_done.load() && second_done.load());
+    CHECK_EQ(first.v2_sessions(), 2u);
+    CHECK_EQ(second.v2_sessions(), 2u);
+    runtime.shutdown();
+}
+
+TEST("MySQL v2 rejects required TLS on plaintext servers and missing connection attributes") {
+    mysql::register_driver();
+    MockMysqlServer server;
+    MockMysqlServer tls_server;
+    REQUIRE(server.started() && tls_server.started());
+    Runtime runtime;
+    runtime.start(Runtime::Config{.m_workers = 1, .m_worker_heap_bytes = 8 * 1024 * 1024});
+    std::atomic<bool> tls_done{false}, attrs_done{false};
+    runtime.spawn(server.run());
+    runtime.spawn(tls_server.run());
+    runtime.spawn(rejected_v2_flow(tls_server.port(), db::TlsMode::Required, 2026, tls_done));
+    runtime.spawn(rejected_v2_flow(server.port(), db::TlsMode::Disabled, 2027, attrs_done));
+    runtime.wait();
+    CHECK(tls_done.load() && attrs_done.load());
+    runtime.shutdown();
+}
+
+TEST("MySQL v2 Rust TLS verifies certificates and supports mutual and full authentication") {
+    mysql::register_driver();
+    for (const auto auth : {MockAuth::Native, MockAuth::CachingSha2Full}) {
+        const bool mutual = auth == MockAuth::Native;
+        MockMysqlServer server(auth, true, true, 1, true, mutual);
+        REQUIRE(server.started());
+        Runtime runtime;
+        runtime.start(Runtime::Config{.m_workers = 1, .m_worker_heap_bytes = 8 * 1024 * 1024});
+        std::atomic<int> stages{0};
+        std::atomic<bool> ok{true};
+        runtime.spawn(server.run());
+        runtime.spawn(client_flow(server.port(), stages, ok, 2, true, mutual));
+        runtime.wait();
+        CHECK_EQ(stages.load(), 5);
+        CHECK(ok.load());
+        CHECK_EQ(server.v2_sessions(), 1u);
+        CHECK_EQ(server.tls_sessions(), 1u);
+        runtime.shutdown();
+    }
+}
+
+TEST("MySQL v2 TLS retains RETURNING results and reconnect settings") {
+    mysql::register_driver();
+    MockMysqlServer server(MockAuth::Native, true, true, 2, true);
+    REQUIRE(server.started());
+    Runtime runtime;
+    runtime.start(Runtime::Config{.m_workers = 1, .m_worker_heap_bytes = 8 * 1024 * 1024});
+    std::atomic<bool> complete{false};
+    runtime.spawn(server.run());
+    runtime.spawn(returning_flow(server.port(), true, complete, true));
+    runtime.wait();
+    CHECK(complete.load());
+    CHECK_EQ(server.v2_sessions(), 2u);
+    CHECK_EQ(server.tls_sessions(), 2u);
+    runtime.shutdown();
+}
+
+TEST("MySQL v2 refuses untrusted TLS certificates without authenticating") {
+    mysql::register_driver();
+    MockMysqlServer server(MockAuth::Native, true, true, 1, true);
+    REQUIRE(server.started());
+    Runtime runtime;
+    runtime.start(Runtime::Config{.m_workers = 1, .m_worker_heap_bytes = 8 * 1024 * 1024});
+    std::atomic<bool> complete{false};
+    runtime.spawn(server.run());
+    runtime.spawn(rejected_v2_flow(server.port(), db::TlsMode::Required, 2026, complete, true));
+    runtime.wait();
+    CHECK(complete.load());
+    CHECK_EQ(server.v2_sessions(), 0u);
+    runtime.shutdown();
+}
+
+TEST("MySQL v2 Lua RETURNING preserves rows and statement metadata with bounded allocations") {
+    mysql::register_driver();
+    for (bool tls : {false, true}) {
+        MockMysqlServer server(MockAuth::Native, true, true, 1, tls);
+        REQUIRE(server.started());
+        mem::RootArena root(256 * 1024 * 1024);
+        mem::HeapArena main_heap(root, 64 * 1024 * 1024);
+        Options options(main_heap);
+        mem::String error{mem::Allocator<char>(&main_heap)};
+        LuaEngine engine(main_heap, options, SYSBENCH_LUA_DIR "/../tests/fixtures/lua_mysql_v2_test.lua",
+                         "run", 0, nullptr);
+        REQUIRE(engine.load(error));
+        REQUIRE(engine.collect_options(error));
+        REQUIRE(options.set("mysql-protocol", "2", error));
+        REQUIRE(engine.install_options(error));
+        Runtime runtime;
+        runtime.start(Runtime::Config{.m_workers = 1, .m_worker_heap_bytes = 8 * 1024 * 1024});
+        runtime.spawn(server.run());
+        const auto port_string = std::to_string(server.port());
+        LuaRunOptions run_options;
+        run_options.m_database.m_port = port_string;
+        run_options.m_database.m_protocol_version = 2;
+        if (tls) {
+            run_options.m_database.m_tls_mode = db::TlsMode::Required;
+            run_options.m_database.m_tls_verify_server_cert = true;
+            run_options.m_database.m_tls_ca = SYSBENCH_MYSQL_CLIENT_LIB_DIR "/tests/fixtures/ca.pem";
+        }
+        run_options.m_events = 200;
+        run_options.m_time_seconds = 5;
+        run_options.m_report_interval = 0;
+        CHECK_EQ(engine.run(runtime, run_options), 0);
+        CHECK(runtime.worker_heap_stats(0).m_used < 4 * 1024 * 1024);
+        CHECK_EQ(server.v2_sessions(), 1u);
+        runtime.shutdown();
+    }
+}
+#endif
+
 TEST("MySQL query throughput over a local mock server") {
     if (!::sb::test::perf_enabled()) return;
     MockMysqlServer server(MockAuth::Native);
@@ -533,7 +1062,7 @@ TEST("MySQL query throughput over a local mock server") {
             mem::ScopedAllocator scope(arena);
             auto result = co_await connection->query("SELECT 1", scope);
             if (result.is_err() || !result.value().m_has_rows ||
-                result.value().m_rows.size() != 1) {
+                result.value().row_count() != 1) {
                 ok.store(false);
                 break;
             }
@@ -602,7 +1131,7 @@ TEST("MySQL concurrent point-select throughput") {
             mem::ScopedAllocator scope(arena);
             auto result = co_await connection->query("SELECT 1", scope);
             if (result.is_err() || !result.value().m_has_rows ||
-                result.value().m_rows.size() != 1) {
+                result.value().row_count() != 1) {
                 failures.fetch_add(1, std::memory_order_relaxed);
                 break;
             }

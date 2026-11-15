@@ -1,0 +1,58 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 720" font-family="Inter, 'Segoe UI', Helvetica, Arial, sans-serif">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#f8fafc"/><stop offset="1" stop-color="#eef2f7"/>
+    </linearGradient>
+  </defs>
+  <rect width="1280" height="720" fill="url(#bg)"/>
+  <rect width="1280" height="92" fill="#0f172a"/>
+  <text x="56" y="58" fill="#f8fafc" font-size="34" font-weight="700">Pipelining (--stream-depth)</text>
+  <text x="1224" y="58" fill="#94a3b8" font-size="18" text-anchor="end">one connection over time · 5 of 5</text>
+
+  <!-- time axis -->
+  <line x1="200" y1="512" x2="1220" y2="512" stroke="#64748b" stroke-width="2"/>
+  <text x="1220" y="534" fill="#64748b" font-size="16" text-anchor="end">time →</text>
+
+  <!-- depth 1 -->
+  <text x="56" y="170" fill="#0f172a" font-size="22" font-weight="700">depth 1</text>
+  <text x="56" y="196" fill="#475569" font-size="16">wait for each reply</text>
+  <g font-size="15" fill="#fff" text-anchor="middle">
+    <rect x="200" y="150" width="60" height="34" rx="6" fill="#2563eb"/><text x="230" y="172">Q1</text>
+    <rect x="200" y="196" width="300" height="16" rx="4" fill="#cbd5e1"/>
+    <rect x="460" y="222" width="60" height="34" rx="6" fill="#16a34a"/><text x="490" y="244">R1</text>
+    <rect x="530" y="150" width="60" height="34" rx="6" fill="#2563eb"/><text x="560" y="172">Q2</text>
+    <rect x="530" y="196" width="300" height="16" rx="4" fill="#cbd5e1"/>
+    <rect x="790" y="222" width="60" height="34" rx="6" fill="#16a34a"/><text x="820" y="244">R2</text>
+    <rect x="860" y="150" width="60" height="34" rx="6" fill="#2563eb"/><text x="890" y="172">Q3</text>
+    <rect x="860" y="196" width="300" height="16" rx="4" fill="#cbd5e1"/>
+    <rect x="1120" y="222" width="60" height="34" rx="6" fill="#16a34a"/><text x="1150" y="244">R3</text>
+  </g>
+  <text x="510" y="290" fill="#475569" font-size="15" text-anchor="middle">a round trip per query (the grey bar)</text>
+
+  <!-- depth 4 -->
+  <text x="56" y="376" fill="#0f172a" font-size="22" font-weight="700">depth 4</text>
+  <text x="56" y="402" fill="#475569" font-size="16">keep 4 in flight</text>
+  <g font-size="15" fill="#fff" text-anchor="middle">
+    <rect x="200" y="356" width="56" height="34" rx="6" fill="#2563eb"/><text x="228" y="378">Q1</text>
+    <rect x="260" y="356" width="56" height="34" rx="6" fill="#2563eb"/><text x="288" y="378">Q2</text>
+    <rect x="320" y="356" width="56" height="34" rx="6" fill="#2563eb"/><text x="348" y="378">Q3</text>
+    <rect x="380" y="356" width="56" height="34" rx="6" fill="#2563eb"/><text x="408" y="378">Q4</text>
+    <rect x="480" y="428" width="56" height="34" rx="6" fill="#16a34a"/><text x="508" y="450">R1</text>
+    <rect x="540" y="356" width="56" height="34" rx="6" fill="#2563eb"/><text x="568" y="378">Q5</text>
+    <rect x="600" y="428" width="56" height="34" rx="6" fill="#16a34a"/><text x="628" y="450">R2</text>
+    <rect x="660" y="356" width="56" height="34" rx="6" fill="#2563eb"/><text x="688" y="378">Q6</text>
+    <rect x="720" y="428" width="56" height="34" rx="6" fill="#16a34a"/><text x="748" y="450">R3</text>
+    <rect x="780" y="356" width="56" height="34" rx="6" fill="#2563eb"/><text x="808" y="378">Q7</text>
+    <rect x="840" y="428" width="56" height="34" rx="6" fill="#16a34a"/><text x="868" y="450">R4</text>
+    <rect x="900" y="356" width="56" height="34" rx="6" fill="#2563eb"/><text x="928" y="378">Q8</text>
+    <rect x="960" y="428" width="56" height="34" rx="6" fill="#16a34a"/><text x="988" y="450">R5</text>
+    <rect x="1020" y="356" width="56" height="34" rx="6" fill="#2563eb"/><text x="1048" y="378">Q9</text>
+    <rect x="1080" y="428" width="56" height="34" rx="6" fill="#16a34a"/><text x="1108" y="450">R6</text>
+  </g>
+  <text x="700" y="490" fill="#475569" font-size="15" text-anchor="middle">a reply is read only when 4 are outstanding; replies arrive in command order</text>
+
+  <rect x="56" y="560" width="1168" height="128" rx="14" fill="#0f172a"/>
+  <text x="84" y="598" fill="#f8fafc" font-size="18"><tspan font-weight="700">Why it helps a benchmark:</tspan><tspan fill="#cbd5e1"> at depth 1 every query waits a full network round trip, so</tspan></text>
+  <text x="84" y="626" fill="#cbd5e1" font-size="18">the client measures the network, not the server. With N in flight the server is never idle</text>
+  <text x="84" y="654" fill="#cbd5e1" font-size="18">waiting for the next command, and the round trip is shared by N queries.</text>
+</svg>

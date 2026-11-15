@@ -1,0 +1,87 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 720" font-family="Inter, 'Segoe UI', Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#334155"/>
+    </marker>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#f8fafc"/><stop offset="1" stop-color="#eef2f7"/>
+    </linearGradient>
+  </defs>
+  <rect width="1280" height="720" fill="url(#bg)"/>
+  <rect width="1280" height="92" fill="#0f172a"/>
+  <text x="56" y="58" fill="#f8fafc" font-size="34" font-weight="700">The worker loop</text>
+  <text x="1224" y="58" fill="#94a3b8" font-size="18" text-anchor="end">all waiting lives here · 4 of 5</text>
+
+  <g font-size="18" fill="#0f172a" text-anchor="middle">
+    <!-- main column -->
+    <rect x="96" y="128" width="300" height="56" rx="12" fill="#ffffff" stroke="#64748b" stroke-width="2"/>
+    <text x="246" y="162">new tasks · due timers</text>
+    <path d="M246,184 L246,212" stroke="#334155" stroke-width="2.5" marker-end="url(#a)"/>
+
+    <rect x="96" y="214" width="300" height="56" rx="12" fill="#dbeafe" stroke="#2563eb" stroke-width="2"/>
+    <text x="246" y="248">run ready tasks (≤ 512)</text>
+    <path d="M246,270 L246,298" stroke="#334155" stroke-width="2.5" marker-end="url(#a)"/>
+
+    <rect x="96" y="300" width="300" height="56" rx="12" fill="#dbeafe" stroke="#2563eb" stroke-width="2"/>
+    <text x="246" y="334">retire finished tasks</text>
+    <path d="M246,356 L246,384" stroke="#334155" stroke-width="2.5" marker-end="url(#a)"/>
+
+    <rect x="96" y="386" width="300" height="70" rx="12" fill="#dcfce7" stroke="#16a34a" stroke-width="2"/>
+    <text x="246" y="416">reap CQEs</text>
+    <text x="246" y="440" font-size="15" fill="#334155">resume each waiter inline</text>
+    <path d="M246,456 L246,486" stroke="#334155" stroke-width="2.5" marker-end="url(#a)"/>
+
+    <!-- decision -->
+    <path d="M246,488 L356,546 L246,604 L136,546 z" fill="#fef9c3" stroke="#ca8a04" stroke-width="2"/>
+    <text x="246" y="542">work ready?</text>
+    <text x="246" y="564" font-size="15" fill="#334155">I/O in flight?</text>
+    <path d="M136,546 C60,546 60,242 94,242" stroke="#334155" stroke-width="2.5" fill="none" marker-end="url(#a)"/>
+    <text x="54" y="400" font-size="15" fill="#334155" transform="rotate(-90 54 400)">ready → run</text>
+
+    <!-- wait_io -->
+    <path d="M356,546 L470,546 L470,300 L518,300" stroke="#334155" stroke-width="2.5" fill="none" marker-end="url(#a)"/>
+    <text x="414" y="534" font-size="15" fill="#334155">in flight</text>
+    <rect x="520" y="200" width="330" height="200" rx="16" fill="#ffffff" stroke="#16a34a" stroke-width="2.5"/>
+    <rect x="520" y="200" width="330" height="48" rx="16" fill="#16a34a"/>
+    <rect x="520" y="230" width="330" height="18" fill="#16a34a"/>
+    <text x="685" y="232" fill="#fff" font-weight="700">wait_io</text>
+    <text x="685" y="282" font-size="16">spin for the expected wait</text>
+    <text x="685" y="306" font-size="14" fill="#475569">learned per wait kind (reply, send, connect)</text>
+    <text x="685" y="342" font-size="16">then one io_uring_enter</text>
+    <text x="685" y="366" font-size="14" fill="#475569">submits SQEs · waits for unawaited + 1 CQEs</text>
+    <text x="685" y="388" font-size="14" fill="#475569">NAPI on: the spin is the kernel's busy poll</text>
+
+    <!-- wait_idle -->
+    <path d="M246,604 L246,640 L500,640 L500,520 L518,520" stroke="#334155" stroke-width="2.5" fill="none" marker-end="url(#a)"/>
+    <text x="360" y="630" font-size="15" fill="#334155">nothing in flight</text>
+    <rect x="520" y="440" width="330" height="160" rx="16" fill="#ffffff" stroke="#7c3aed" stroke-width="2.5"/>
+    <rect x="520" y="440" width="330" height="48" rx="16" fill="#7c3aed"/>
+    <rect x="520" y="470" width="330" height="18" fill="#7c3aed"/>
+    <text x="685" y="472" fill="#fff" font-weight="700">wait_idle</text>
+    <text x="685" y="522" font-size="16">one spinner per NUMA node</text>
+    <text x="685" y="546" font-size="14" fill="#475569">for the learned reply wait</text>
+    <text x="685" y="580" font-size="16">others: futex until woken</text>
+
+    <path d="M850,300 L900,300 L900,108 L246,108 L246,124" stroke="#334155" stroke-width="2.5" fill="none" marker-end="url(#a)"/>
+    <path d="M850,520 L900,520 L900,300" stroke="#334155" stroke-width="2.5" fill="none"/>
+    <text x="574" y="128" font-size="15" fill="#334155">woken → next round</text>
+
+    <!-- side notes -->
+    <rect x="960" y="200" width="264" height="400" rx="16" fill="#0f172a"/>
+    <text x="1092" y="240" fill="#f8fafc" font-weight="700">Rules</text>
+    <g font-size="15" fill="#cbd5e1" text-anchor="start">
+      <text x="984" y="280">• tasks never spin or sleep;</text>
+      <text x="996" y="302">they suspend on an awaiter</text>
+      <text x="984" y="338">• an awaiter declares its</text>
+      <text x="996" y="360">wait kind; the loop learns</text>
+      <text x="996" y="382">how long such waits take</text>
+      <text x="984" y="418">• single-writer counters:</text>
+      <text x="996" y="440">no locked RMW per query</text>
+      <text x="984" y="476">• send completions are</text>
+      <text x="996" y="498">worker-owned: a closing</text>
+      <text x="996" y="520">connection never waits</text>
+      <text x="984" y="556">• blocking mode: tasks</text>
+      <text x="996" y="578">rarely reach the loop</text>
+    </g>
+  </g>
+</svg>

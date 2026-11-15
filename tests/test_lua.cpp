@@ -72,7 +72,7 @@ public:
     int executes() const { return m_executes.load(); }
 
     Task<void> run() {
-        SocketIo io(*Runtime::current(), Runtime::current_worker_id(), 64, 4, 4096);
+        SocketIo io(*Runtime::current(), Runtime::current_worker_id(), 4, 4096);
         m_io = &io;
         sockaddr_in peer{};
         socklen_t length = sizeof(peer);
@@ -351,6 +351,30 @@ TEST("Lua SQL allocations stay bounded across events") {
     const auto stats = runtime.worker_heap_stats(0);
     CHECK(stats.m_used < 4 * 1024 * 1024);
     CHECK_EQ(server.executes(), 2000);
+    runtime.shutdown();
+}
+
+TEST("Lua MySQL HANDLER module modes and session lifecycle") {
+    mem::RootArena root(256 * 1024 * 1024);
+    mem::HeapArena main_heap(root, 64 * 1024 * 1024);
+    Options options(main_heap);
+    mem::String error{mem::Allocator<char>(&main_heap)};
+    LuaEngine engine(main_heap, options, "tests/fixtures/lua_mysql_handler_test.lua",
+                     "run", 0, nullptr);
+    REQUIRE(engine.load(error));
+    REQUIRE(engine.collect_options(error));
+    CHECK_EQ(options.as_string("handler-mode"), "point");
+    CHECK_EQ(options.as_int("handler-reads"), 1);
+    CHECK(engine.command_parallel("prepare"));
+    REQUIRE(engine.install_options(error));
+
+    Runtime runtime;
+    runtime.start(runtime_config());
+    LuaRunOptions run_options;
+    run_options.m_events = 1;
+    run_options.m_time_seconds = 5;
+    run_options.m_report_interval = 0;
+    CHECK_EQ(engine.run(runtime, run_options), 0);
     runtime.shutdown();
 }
 

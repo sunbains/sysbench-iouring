@@ -15,7 +15,12 @@
 // Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
 #include "sysbench/io_ring.hpp"
+#include <thread>
+#include <atomic>
+
+#include <algorithm>
 #include "sysbench/numa.hpp"
+#include "sysbench/layer_stats.hpp"
 
 #include <cerrno>
 #include <cstdio>
@@ -37,22 +42,30 @@ constexpr unsigned kMaxSlots = IoRing::kMaxRegisteredBuffers;
 
 }  // namespace
 
-IoRing::IoRing(unsigned entries) : m_entries(entries) {
+IoRing::IoRing(unsigned entries, unsigned setup_flags) : m_entries(entries) {
     if (entries == 0) throw std::invalid_argument("io_uring entries must be non-zero");
 
-    // Deliberately no IORING_SETUP_COOP_TASKRUN.  That mode defers completion
-    // notification to task work run in the submitting task's context.  Here the
-    // submitter is a runtime worker that may be spinning in user space and the
-    // waiter is a different thread polling the ring's CQ eventfd, so the
-    // notification would stall until the submitter next entered the kernel --
-    // turning every wait into a spin-budget-length delay.
     io_uring_params params{};
-    const int result = io_uring_queue_init_params(entries, &m_ring, &params);
+    params.flags = setup_flags;
+    if ((setup_flags & IORING_SETUP_SQPOLL) != 0) {
+        params.sq_thread_idle = 2000;
+    }
+    int result = io_uring_queue_init_params(entries, &m_ring, &params);
+    if (result == -EINVAL && (setup_flags & IORING_SETUP_DEFER_TASKRUN) != 0) {
+        params = io_uring_params{};
+        params.flags = (setup_flags & ~IORING_SETUP_DEFER_TASKRUN) | IORING_SETUP_COOP_TASKRUN;
+        result = io_uring_queue_init_params(entries, &m_ring, &params);
+    }
+    if (result == 0) m_features = params.features;
     if (result < 0) {
         throw std::system_error(-result, std::generic_category(),
                                 "io_uring_queue_init_params");
     }
     m_initialized = true;
+    m_sqpoll = (params.flags & IORING_SETUP_SQPOLL) != 0;
+    /* Registered ring fd: io_uring_enter then names the ring by index and
+    skips looking up (and reference counting) its file on every call. */
+    (void)io_uring_register_ring_fd(&m_ring);
 }
 
 IoRing::~IoRing() {
@@ -88,7 +101,9 @@ io_uring_sqe* IoRing::acquire_sqe(IoCompletion* completion) noexcept {
         return nullptr;
     }
     io_uring_sqe_set_data(sqe, completion);
+    SB_COUNT(Sqes, 1);
     ++m_queued;
+    m_last_sqe = sqe;
     return sqe;
 }
 
@@ -139,6 +154,7 @@ bool IoRing::submit_recv(int fd, void* buffer, unsigned length, int flags,
     io_uring_sqe* sqe = acquire_sqe(completion);
     if (sqe == nullptr) return false;
     io_uring_prep_recv(sqe, fd, buffer, length, flags);
+    use_fixed_file(sqe, fd);
     return true;
 }
 
@@ -147,6 +163,114 @@ bool IoRing::submit_send(int fd, const void* buffer, unsigned length, int flags,
     io_uring_sqe* sqe = acquire_sqe(completion);
     if (sqe == nullptr) return false;
     io_uring_prep_send(sqe, fd, buffer, length, flags);
+    use_fixed_file(sqe, fd);
+    return true;
+}
+
+bool IoRing::submit_nop(IoCompletion* completion) noexcept {
+    io_uring_sqe* sqe = acquire_sqe(completion);
+    if (sqe == nullptr) return false;
+    io_uring_prep_nop(sqe);
+    return true;
+}
+
+bool IoRing::submit_send_posted(int fd, const void* buffer, unsigned length,
+                                IoCompletion* completion) noexcept {
+    io_uring_sqe* sqe = acquire_sqe(completion);
+    if (sqe == nullptr) return false;
+    if (m_send_zc) {
+        io_uring_prep_send_zc(sqe, fd, buffer, length, MSG_WAITALL | MSG_NOSIGNAL, 0);
+        use_fixed_file(sqe, fd);
+    } else {
+        io_uring_prep_send(sqe, fd, buffer, length, MSG_WAITALL | MSG_NOSIGNAL);
+        use_fixed_file(sqe, fd);
+    }
+    return true;
+}
+
+bool IoRing::submit_recv_multishot(int fd, std::uint16_t group, IoCompletion* completion) noexcept {
+    io_uring_sqe* sqe = acquire_sqe(completion);
+    if (sqe == nullptr) return false;
+    io_uring_prep_recv_multishot(sqe, fd, nullptr, 0, 0);
+    use_fixed_file(sqe, fd);
+    sqe->flags |= IOSQE_BUFFER_SELECT;
+    sqe->buf_group = group;
+    return true;
+}
+
+int IoRing::register_socket(int fd) noexcept {
+    if (fd < 0 || static_cast<unsigned>(fd) >= kMaxFixedFds) return -1;
+    if (!m_files_registered) {
+        if (io_uring_register_files_sparse(&m_ring, kMaxFixedSlots) < 0) return -1;
+        m_files_registered = true;
+    }
+    if (m_fixed_slot[fd] >= 0) return m_fixed_slot[fd];
+    for (unsigned slot = 0; slot < kMaxFixedSlots; ++slot) {
+        if (m_slot_fd[slot] < 0) {
+            if (io_uring_register_files_update(&m_ring, slot, &fd, 1) != 1) return -1;
+            m_slot_fd[slot] = fd;
+            m_fixed_slot[fd] = static_cast<std::int16_t>(slot);
+            return static_cast<int>(slot);
+        }
+    }
+    return -1;
+}
+
+void IoRing::unregister_socket(int fd) noexcept {
+    if (fd < 0 || static_cast<unsigned>(fd) >= kMaxFixedFds || m_fixed_slot[fd] < 0) return;
+    const int slot = m_fixed_slot[fd];
+    int none = -1;
+    (void)io_uring_register_files_update(&m_ring, static_cast<unsigned>(slot), &none, 1);
+    m_slot_fd[slot] = -1;
+    m_fixed_slot[fd] = -1;
+}
+
+void IoRing::submit_and_collect() noexcept {
+    SB_LAYER(KernelSubmit);
+    SB_COUNT(SubmitCalls, 1);
+    const unsigned queued = m_queued;
+    /* With SQPOLL the kernel thread takes the SQEs and posts the CQEs:
+    publishing the SQ tail is the whole submission (liburing enters only to
+    wake an idle poll thread). */
+    const int result = m_sqpoll ? io_uring_submit(&m_ring) : io_uring_submit_and_get_events(&m_ring);
+    if (result < 0) {
+        m_last_error = -result;
+        return;
+    }
+    if (queued != 0) {
+        ++m_submit_epoch;
+        m_submissions += static_cast<unsigned>(result);
+        m_queued = static_cast<unsigned>(result) >= queued ? 0 : queued - static_cast<unsigned>(result);
+    }
+}
+
+void IoRing::submit_and_wait(__kernel_timespec* timeout, unsigned wait_nr) noexcept {
+    SB_LAYER(KernelWait);
+    SB_COUNT(WaitCalls, 1);
+    const unsigned queued = m_queued;
+    io_uring_cqe* cqe = nullptr;
+    const int result = io_uring_submit_and_wait_timeout(&m_ring, &cqe, wait_nr, timeout, nullptr);
+    if (queued != 0) {
+        ++m_submit_epoch;
+        m_queued = 0;
+        m_submissions += queued;
+    }
+    if (result < 0 && result != -ETIME && result != -EINTR) m_last_error = -result;
+}
+
+bool IoRing::enable_napi(unsigned busy_poll_us) noexcept {
+    if (!m_initialized || busy_poll_us == 0) return false;
+    /* Dynamic tracking: each socket's NAPI id is added when a poll is armed
+    on it (the reply's receive is POLL_FIRST, so it always is). */
+    io_uring_napi settings{};
+    settings.busy_poll_to = busy_poll_us;
+    settings.prefer_busy_poll = 1;
+    const int result = io_uring_register_napi(&m_ring, &settings);
+    if (result < 0) {
+        m_last_error = -result;
+        return false;
+    }
+    m_napi = true;
     return true;
 }
 
@@ -162,6 +286,7 @@ int IoRing::flush_submit() noexcept {
         if (submitted == 0) break;
         const unsigned count = static_cast<unsigned>(submitted);
         m_queued = count >= m_queued ? 0 : m_queued - count;
+        ++m_submit_epoch;
         m_inflight.fetch_add(count, std::memory_order_relaxed);
         total += submitted;
         m_submissions += count;
@@ -195,12 +320,26 @@ int IoRing::wait_completion(__kernel_timespec* timeout) noexcept {
 RegisteredBufferPool::RegisteredBufferPool(IoRing& ring, mem::MemoryResource& memory,
                                            unsigned slot_size, unsigned slot_count,
                                            int numa_node)
-    : m_ring(&ring), m_memory(&memory), m_slot_size(slot_size), m_slot_count(slot_count),
+    : RegisteredBufferPool(memory, slot_size, slot_count, numa_node) {
+    m_ring = &ring;
+    m_ring->register_buffers(std::span<const iovec>(m_iovecs, m_slot_count));
+}
+
+RegisteredBufferPool::RegisteredBufferPool(mem::MemoryResource& memory,
+                                           unsigned slot_size, unsigned slot_count,
+                                           int numa_node)
+    : m_ring(nullptr), m_memory(&memory), m_slot_size(slot_size), m_slot_count(slot_count),
       m_numa_node(numa_node) {
     if (m_slot_count == 0 || m_slot_count > kMaxSlots) {
         throw std::invalid_argument("invalid registered buffer slot count");
     }
     if (m_slot_size == 0) throw std::invalid_argument("invalid registered buffer size");
+
+    m_slots = static_cast<Slot*>(m_memory->allocate(sizeof(Slot) * m_slot_count, alignof(Slot)));
+    m_free_stack = static_cast<unsigned*>(
+        m_memory->allocate(sizeof(unsigned) * m_slot_count, alignof(unsigned)));
+    m_iovecs = static_cast<iovec*>(m_memory->allocate(sizeof(iovec) * m_slot_count, alignof(iovec)));
+    for (unsigned i = 0; i < m_slot_count; ++i) ::new (&m_slots[i]) Slot{};
 
     const std::size_t stride = round_up(m_slot_size, kPageSize);
     const std::size_t total = stride * m_slot_count;
@@ -218,7 +357,6 @@ RegisteredBufferPool::RegisteredBufferPool(IoRing& ring, mem::MemoryResource& me
         m_free_stack[i] = i;
     }
     m_free_count = m_slot_count;
-    m_ring->register_buffers(std::span<const iovec>(m_iovecs.data(), m_slot_count));
 }
 
 RegisteredBufferPool::~RegisteredBufferPool() {

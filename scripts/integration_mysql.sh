@@ -24,7 +24,7 @@ ARGS=(
   --mysql-ssl="$MYSQL_SSL"
 )
 
-for benchmark in oltp_point_select oltp_read_only oltp_write_only oltp_read_write; do
+for benchmark in oltp_point_select oltp_read_only oltp_write_only oltp_read_write mysql_handler; do
   echo "=== ${benchmark}: prepare ==="
   "$SYSBENCH" "$benchmark" "${ARGS[@]}" --threads="$THREADS" prepare
   echo "=== ${benchmark}: run ==="

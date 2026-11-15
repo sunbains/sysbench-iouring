@@ -98,6 +98,10 @@ const Topology& Topology::instance() {
 
 Topology::Topology() {
     m_cpu_to_node.fill(-1);
+    CPU_ZERO(&m_process_cpus);
+    if (::sched_getaffinity(0, sizeof(m_process_cpus), &m_process_cpus) != 0) {
+        for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) CPU_SET(cpu, &m_process_cpus);
+    }
     const int current_cpu = ::sched_getcpu();
     m_reserved_cpu = current_cpu >= 0 ? current_cpu : -1;
     m_available = numa_available() >= 0;
